@@ -21,6 +21,11 @@ pub struct Client {
     w: Mutex<Option<UnixStream>>,
     waiters: Waiters,
     pending_ingest: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
+    /// (mandate, session) keys that have seen untrusted output. State is per key; the scorer
+    /// keeps one shared INT8 inference session and serves all keys through one FIFO queue.
+    untrusted: Mutex<HashSet<String>>,
+    /// Set when a periodic probe re-check fails: Tier 2 is then unavailable (fail closed).
+    pub health: Arc<Mutex<Option<String>>>,
     next: AtomicU64,
     pub cfg: Config,
     pub model_digest: String,
@@ -46,6 +51,9 @@ pub struct SpawnOpts {
     pub scorer_config: crate::config::ScorerConfig,
     /// Path of the config file passed to the scorer process (it re-verifies weights + threshold).
     pub scorer_config_path: PathBuf,
+    /// DIAGNOSTIC ONLY (score-only pass for a config without probe refs): skip the probe check.
+    /// The config version is then recorded as `<id>+diag-noprobe`; never for enforcement.
+    pub diagnostic_no_probe: bool,
 }
 
 impl Client {
@@ -61,13 +69,15 @@ impl Client {
                 o.scorer_config.config_version, o.scorer_config.model_sha256
             )));
         }
-        let w = allowlist::sha256_file(&o.scorer_dir.join(&o.scorer_config.weights_file))
-            .map_err(|e| ClientError(format!("weights: {e:?}")))?;
-        if w != o.scorer_config.weights_sha256 {
-            return Err(ClientError(format!(
-                "weights sha256 {w} != config {} pin",
-                o.scorer_config.config_version
-            )));
+        if let (Some(f), Some(pin)) = (&o.scorer_config.weights_file, &o.scorer_config.weights_sha256) {
+            let w = allowlist::sha256_file(&o.scorer_dir.join(f))
+                .map_err(|e| ClientError(format!("weights: {e:?}")))?;
+            if &w != pin {
+                return Err(ClientError(format!(
+                    "weights sha256 {w} != config {} pin",
+                    o.scorer_config.config_version
+                )));
+            }
         }
         let _ = std::fs::remove_file(&o.socket);
         let mut child = Command::new(&o.python)
@@ -80,6 +90,7 @@ impl Client {
             .arg(&digest)
             .arg("--config")
             .arg(&o.scorer_config_path)
+            .args(if o.diagnostic_no_probe { vec!["--diagnostic-no-probe"] } else { vec![] })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -105,6 +116,9 @@ impl Client {
         };
         let mut c = Self::from_stream(s, o.cfg, digest.clone(), o.log)?;
         c.config_version = o.scorer_config.config_version.clone();
+        if o.diagnostic_no_probe {
+            c.config_version.push_str("+diag-noprobe");
+        }
         *c.child.lock().unwrap() = Some(child);
         let hello = c
             .call(json!({"op": "hello"}), Duration::from_secs(60))
@@ -191,6 +205,8 @@ impl Client {
             w: Mutex::new(Some(s)),
             waiters,
             pending_ingest: pending,
+            untrusted: Mutex::default(),
+            health: Arc::default(),
             next: AtomicU64::new(1),
             cfg,
             model_digest,
@@ -207,6 +223,8 @@ impl Client {
             w: Mutex::new(None),
             waiters: Arc::default(),
             pending_ingest: Arc::default(),
+            untrusted: Mutex::default(),
+            health: Arc::default(),
             next: AtomicU64::new(1),
             cfg,
             model_digest: String::new(),
@@ -241,6 +259,10 @@ impl Client {
     /// Cache untrusted output as it arrives. Fire-and-forget: embedding happens in the scorer,
     /// off the agent's response path; the ack clears the session's pending set.
     pub fn ingest(&self, session: &str, text: &str) {
+        self.untrusted.lock().unwrap().insert(session.to_string());
+        if self.dead.is_some() {
+            return;
+        }
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         self.pending_ingest
             .lock()
@@ -255,6 +277,56 @@ impl Client {
                 .get_mut(session)
                 .map(|s| s.remove(&id));
         }
+    }
+
+    pub fn has_untrusted(&self, session: &str) -> bool {
+        self.untrusted.lock().unwrap().contains(session)
+    }
+
+    /// Why Tier 2 is unavailable right now (refused to start, or a failed periodic re-check).
+    pub fn unavailable(&self) -> Option<String> {
+        self.dead.clone().or_else(|| self.health.lock().unwrap().clone())
+    }
+
+    /// One probe re-check through the same FIFO queue as scoring (one shared INT8 session).
+    /// On failure or no answer, Tier 2 is marked unavailable for good (fail closed).
+    pub fn recheck(&self, timeout: Duration) -> bool {
+        if self.dead.is_some() {
+            return false;
+        }
+        let r = self.call(json!({"op": "probe"}), timeout);
+        let ok = r
+            .as_ref()
+            .and_then(|v| v.get("determinism_ok"))
+            .and_then(|v| v.as_bool())
+            == Some(true);
+        if !ok {
+            let why = format!(
+                "periodic probe re-check failed: {}",
+                r.and_then(|v| v.get("determinism").cloned()).unwrap_or(json!("no reply"))
+            );
+            eprintln!("[sentryra] tier2 UNAVAILABLE (fail closed): {why}");
+            *self.health.lock().unwrap() = Some(why);
+        } else {
+            eprintln!("[sentryra] tier2 periodic probe re-check passed");
+        }
+        ok
+    }
+
+    /// Run `recheck` every `cfg.recheck_secs` (0 = off) until the client is dropped.
+    pub fn start_recheck(self: &Arc<Self>) {
+        let secs = self.cfg.recheck_secs;
+        if secs == 0 || self.dead.is_some() {
+            return;
+        }
+        let w = Arc::downgrade(self);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(secs));
+            let Some(c) = w.upgrade() else { return };
+            if !c.recheck(Duration::from_secs(30)) {
+                return;
+            }
+        });
     }
 
     pub fn cache_ready(&self, session: &str) -> bool {
@@ -292,7 +364,7 @@ impl Client {
         if diag {
             v["diag"] = json!(true);
         }
-        if self.dead.is_some() {
+        if self.unavailable().is_some() {
             return (id, T2Result::Unavailable);
         }
         if !self.cache_ready(session) {
@@ -365,6 +437,10 @@ mod t {
 
     /// Fake scorer on a unix socket: replies after `delay_ms`, acks ingests after `ingest_ms`.
     fn fake(delay_ms: u64, ingest_ms: u64, reply: Value) -> Client {
+        fake_probe(delay_ms, ingest_ms, reply, true)
+    }
+    /// Single-threaded like the real server: one FIFO queue in front of one inference session.
+    fn fake_probe(delay_ms: u64, ingest_ms: u64, reply: Value, probe_ok: bool) -> Client {
         let p =
             std::env::temp_dir().join(format!("t2fake{}-{}.sock", std::process::id(), rand_id()));
         let _ = std::fs::remove_file(&p);
@@ -385,6 +461,9 @@ mod t {
                         r["id"] = v["id"].clone();
                         r["op"] = json!("score");
                         let _ = writeln!(w, "{r}");
+                    }
+                    Some("probe") => {
+                        let _ = writeln!(w, "{}", json!({"id": v["id"], "op": "probe", "determinism_ok": probe_ok, "determinism": "fake"}));
                     }
                     _ => {}
                 }
@@ -469,6 +548,40 @@ mod t {
         // other sessions are unaffected
         assert!(c.cache_ready("other"));
     }
+    #[test]
+    fn per_mandate_session_state_isolated() {
+        let c = fake(0, 0, ok_reply());
+        c.ingest("m:A/s1", "untrusted for A");
+        assert!(c.has_untrusted("m:A/s1"));
+        assert!(!c.has_untrusted("m:B/s1"));
+        assert!(!c.has_untrusted("m:A/s2"));
+    }
+    #[test]
+    fn queue_wait_counts_toward_deadline() {
+        // one shared session, serialized: the 2nd call waits behind the 1st (8 ms each, 10 ms deadline)
+        let c = Arc::new(fake(8, 0, ok_reply()));
+        let c2 = c.clone();
+        let h = std::thread::spawn(move || {
+            c2.score("a", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false).1
+        });
+        std::thread::sleep(Duration::from_millis(1));
+        let (_, r2) = c.score("b", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false);
+        let r1 = h.join().unwrap();
+        assert!(matches!(r1, T2Result::Scored(_)), "{r1:?}");
+        assert!(matches!(r2, T2Result::Timeout { cache_not_ready: false }), "{r2:?}");
+    }
+    #[test]
+    fn periodic_recheck_failure_fails_closed() {
+        let c = fake_probe(0, 0, ok_reply(), false);
+        assert!(!c.recheck(Duration::from_secs(2)));
+        assert!(c.unavailable().is_some());
+        let (_, r) = c.score("s", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false);
+        assert!(matches!(r, T2Result::Unavailable));
+        let ok = fake_probe(0, 0, ok_reply(), true);
+        assert!(ok.recheck(Duration::from_secs(2)));
+        assert!(ok.unavailable().is_none());
+        assert_eq!(Config::default().recheck_secs, 60);
+    }
 }
 
 #[cfg(test)]
@@ -490,11 +603,11 @@ mod dead_t {
         );
         assert!(matches!(r, T2Result::Unavailable));
         assert_eq!(
-            apply(Outcome::Allow, SideEffect::ExternalSend, &r, &c.cfg).outcome,
+            apply(Outcome::Allow, SideEffect::ExternalSend, &r, &c.cfg, crate::rules::Ctx { untrusted_in_session: true }).outcome,
             Outcome::Escalate
         );
         assert_eq!(
-            apply(Outcome::Allow, SideEffect::Read, &r, &c.cfg).outcome,
+            apply(Outcome::Allow, SideEffect::Read, &r, &c.cfg, crate::rules::Ctx { untrusted_in_session: true }).outcome,
             Outcome::Allow
         );
     }

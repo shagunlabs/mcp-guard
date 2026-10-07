@@ -1,0 +1,13 @@
+{
+  "config_version": "t2-v1-perwin",
+  "scorer_config": "v1",
+  "scorer_version": "t2-scorer-0.1.0",
+  "model_sha256": "7304e205d537eff13b20c2d104e4d6664b7a603945fdcc5909f3817bdaf20a05",
+  "weights_file": null,
+  "weights_sha256": null,
+  "threshold": 0.50,
+  "near_margin": 0.03,
+  "probe_reference_file": "handoff/probe_refs_v1.json",
+  "probe_reference_sha256": "a1928440319bb879072062adc84e074c6236923eb669ecd7af11f088f034f2b1",
+  "probe_tolerance": 0.005
+}

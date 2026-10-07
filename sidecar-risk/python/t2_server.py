@@ -16,6 +16,8 @@ ap.add_argument("--scorer-dir", required=True)
 ap.add_argument("--socket", required=True)
 ap.add_argument("--expect-sha256", required=True)
 ap.add_argument("--config", required=True, help="versioned scorer config (scorer version + weights ref + threshold)")
+ap.add_argument("--feature-export", action="store_true", help="DEV/HELDOUT: include full feature export in diag flush")
+ap.add_argument("--diagnostic-no-probe", action="store_true", help="DIAGNOSTIC ONLY: skip the probe check (score-only pass)")
 a = ap.parse_args()
 sys.path.insert(0, a.scorer_dir)
 import scorer  # noqa: E402  (the research single entrypoint)
@@ -25,12 +27,28 @@ if a.expect_sha256 != scorer.EXPECTED_MODEL_SHA256:
     sys.exit(f"t2_server: Edge allowlist digest {a.expect_sha256} != scorer pin {scorer.EXPECTED_MODEL_SHA256}; refusing")
 scorer.verify_model(model, a.expect_sha256)          # raises ModelDigestMismatch before loading
 CFG = json.load(open(a.config))
+KEY = CFG["scorer_config"]
+if KEY not in scorer.CONFIGS or scorer.CONFIGS[KEY]["config_version"] != CFG["config_version"]:
+    sys.exit(f"t2_server: config {CFG['config_version']} is not scorer config {KEY!r}; refusing")
+if abs(float(scorer.CONFIGS[KEY]["threshold"]) - float(CFG["threshold"])) > 1e-12:
+    sys.exit(f"t2_server: config threshold {CFG['threshold']} != scorer {KEY} threshold; refusing")
 if CFG["model_sha256"] != a.expect_sha256 or CFG["scorer_version"] != scorer.MODEL_VERSION:
     sys.exit(f"t2_server: config {CFG['config_version']} does not match model/scorer version; refusing")
-wpath = os.path.join(a.scorer_dir, CFG["weights_file"])
-if hashlib.sha256(open(wpath, "rb").read()).hexdigest() != CFG["weights_sha256"]:
-    sys.exit(f"t2_server: weights sha256 != config {CFG['config_version']}; refusing")
-W = json.load(open(wpath))
+W = None                                             # V1: weights pinned in scorer.CONFIGS
+if CFG.get("weights_file"):
+    wpath = os.path.join(a.scorer_dir, CFG["weights_file"])
+    if hashlib.sha256(open(wpath, "rb").read()).hexdigest() != CFG["weights_sha256"]:
+        sys.exit(f"t2_server: weights sha256 != config {CFG['config_version']}; refusing")
+    W = json.load(open(wpath))
+THR = float(CFG["threshold"])
+EXPORT = a.feature_export or os.environ.get("T2_FEATURE_EXPORT") == "1"
+CFG_ID = CFG["config_version"] + ("+diag-noprobe" if a.diagnostic_no_probe else "")
+
+
+def new_scorer():
+    return scorer.Tier2Scorer(W=W, encoder=ENC, threshold=THR, config=KEY)
+
+
 ENC = scorer.Encoder(model)                          # the one and only INT8 session
 for _ in range(5):                                   # warm-up before accepting (stateless: no session data)
     ENC.one("warm-up text for the tier two scorer session " * 8)
@@ -43,6 +61,8 @@ for _ in range(5):                                   # warm-up before accepting 
 
 
 def self_check():
+    """Probe check against the research pinned reference (handoff/probe_refs.json format). The file must be
+    pinned to the ACTIVE config: same config_version, model sha256 and threshold, else refuse."""
     rp = os.path.join(a.scorer_dir, CFG["probe_reference_file"])
     if not os.path.exists(rp):
         return False, {"error": f"probe reference file missing: {CFG['probe_reference_file']}"}
@@ -51,21 +71,31 @@ def self_check():
     if pin and hashlib.sha256(raw).hexdigest() != pin:
         return False, {"error": "probe reference sha256 != config pin"}
     ref = json.loads(raw)
-    tol, out, ok = float(CFG["probe_tolerance"]), [], bool(ref.get("probes"))
+    for k, want in (("config_version", CFG["config_version"]), ("model_sha256", CFG["model_sha256"])):
+        if ref.get(k) != want:
+            return False, {"error": f"probe reference {k} {ref.get(k)!r} != active {want!r}"}
+    if not isinstance(ref.get("threshold"), (int, float)) or abs(float(ref["threshold"]) - THR) > 1e-12:
+        return False, {"error": f"probe reference threshold {ref.get('threshold')!r} != active {THR}"}
+    tol = min(float(CFG["probe_tolerance"]), float(ref.get("tolerance", CFG["probe_tolerance"])))
+    out, ok = [], bool(ref.get("probes"))
     for pr in ref.get("probes", []):
-        sc = scorer.Tier2Scorer(W=W, encoder=ENC)
+        sc = new_scorer()                            # fresh state per probe, same INT8 session
         for u in pr.get("untrusted", []):
             sc.ingest(u)
-        r = sc.score_call(pr["purpose"], pr.get("tool", "mail.send"), pr.get("side_effect", "external_send"), pr.get("resource"), pr["args"])
+        r = sc.score_call(pr["purpose"], "send_email", "external_send", "mailto:probe@example.invalid", {"body": pr["outbound"]})
         got = None if r is None else r["score"]
-        good = got is not None and abs(got - float(pr["score"])) <= tol
+        good = got is not None and abs(got - float(pr["ref_score"])) <= tol \
+            and r["windows_read"] == pr.get("windows_read") and r["windows_total"] == pr.get("windows_total")
         ok &= good
-        out.append({"id": pr.get("id"), "ref": pr["score"], "got": got, "ok": good,
+        out.append({"id": pr.get("id"), "ref": pr["ref_score"], "got": got, "ok": good,
                     "windows": None if r is None else f"{r['windows_read']}/{r['windows_total']}"})
-    return ok, {"reference_version": ref.get("reference_version"), "pinned": bool(pin), "tolerance": tol, "probes": out}
+    return ok, {"reference": CFG["probe_reference_file"], "config_version": ref.get("config_version"), "tolerance": tol, "probes": out}
 
 
-DET_OK, DET = self_check()
+if a.diagnostic_no_probe:
+    DET_OK, DET = True, {"skipped": "DIAGNOSTIC ONLY (--diagnostic-no-probe): no probe reference for this config"}
+else:
+    DET_OK, DET = self_check()
 print(f"t2_server: probe self-check {'PASS' if DET_OK else 'FAIL'} {json.dumps(DET)}", file=sys.stderr, flush=True)
 if not DET_OK:
     sys.exit("t2_server: probe self-check failed; refusing to start (Edge fails closed)")
@@ -75,8 +105,14 @@ DIAG = []                                            # (score_id, session, purpo
 
 def session(k):
     if k not in SESS:
-        SESS[k] = scorer.Tier2Scorer(W=W, encoder=ENC)
+        SESS[k] = new_scorer()          # per (mandate, session) state; one shared INT8 session
     return SESS[k]
+
+
+def _snap(sc, untrusted):
+    tmp = new_scorer()
+    tmp.chunk, tmp.pemb, tmp.untrusted = sc.chunk, sc.pemb, list(untrusted)
+    return tmp
 
 
 def window_scores(sc, purpose, text, untrusted, resp):
@@ -87,20 +123,51 @@ def window_scores(sc, purpose, text, untrusted, resp):
         return [resp["score"]]
     ws, _ = scorer.windows(ENC, text)
     idx = scorer.select(ws, untrusted, purpose)
-    tmp = scorer.Tier2Scorer.__new__(scorer.Tier2Scorer)
-    tmp.W, tmp.enc, tmp.chunk, tmp.pemb, tmp.untrusted, tmp.sink_hist = sc.W, ENC, sc.chunk, sc.pemb, list(untrusted), {}
+    tmp = _snap(sc, untrusted)
+    tmp.cfg = dict(tmp.cfg, pooling="pooled")       # one window at a time = per-window features
     out = []
     for i in idx:
         f, _, _ = tmp._features(purpose, ws[i])
-        out.append({"window": i, "score": round(scorer.score_from_features(f, sc.W), 4)})
+        out.append({"window": i, "score": round(scorer.score_from_features(f, tmp.W), 4)})
     return out
+
+
+def feature_export(sc, purpose, text, untrusted, resp):
+    """DEV / HELDOUT export (diag only, never on the decision path): window texts, the untrusted
+    context the scorer saw, every feature value (decision features + per read window), scores."""
+    if text is None:
+        return {"text": None, "scored": resp is not None}
+    ws, ntok = scorer.windows(ENC, text)
+    idx = scorer.select(ws, untrusted, purpose)
+    tmp = _snap(sc, untrusted)
+    dec = None
+    if resp is not None and not (set(resp["reason_codes"]) & {scorer.RC_FRAG, scorer.RC_PLACEHOLDER}):
+        f, r, t = tmp._features(purpose, text)
+        dec = {"features": f, "score": round(scorer.score_from_features(f, tmp.W), 6), "windows_read": r, "windows_total": t}
+    per = []
+    pw = _snap(sc, untrusted); pw.cfg = dict(pw.cfg, pooling="pooled")
+    for i, w in enumerate(ws):
+        e = {"window": i, "read": i in idx, "text": w}
+        if untrusted:
+            f, _, _ = pw._features(purpose, w)
+            e.update(features=f, score=round(scorer.score_from_features(f, pw.W), 6))
+        per.append(e)
+    return {"purpose": purpose, "outbound_tokens": ntok, "untrusted_context": list(untrusted),
+            "windows": per, "decision": dec, "weights": tmp.W, "threshold": THR,
+            "response": resp}
 
 
 def handle(m):
     op = m.get("op")
     if op == "hello":
         return {"id": m["id"], "op": "hello", "model_digest": scorer.MODEL_DIGEST, "model_version": scorer.MODEL_VERSION, "model_id": scorer.MODEL_ID,
-                "config_version": CFG["config_version"], "determinism_ok": DET_OK, "determinism": DET}
+                "config_version": CFG_ID, "determinism_ok": DET_OK, "determinism": DET}
+    if op == "probe" and a.diagnostic_no_probe:
+        return {"id": m["id"], "op": "probe", "determinism_ok": True, "determinism": DET}
+    if op == "probe":   # periodic re-check, queued FIFO behind scoring on the one INT8 session
+        ok, det = self_check()
+        print(f"t2_server: periodic probe re-check {'PASS' if ok else 'FAIL'}", file=sys.stderr, flush=True)
+        return {"id": m["id"], "op": "probe", "determinism_ok": ok, "determinism": det}
     if op == "ingest":
         session(m["session"]).ingest(m["text"])
         return {"ack": m["id"], "session": m["session"]}
@@ -118,7 +185,8 @@ def handle(m):
         outs = []
         for sid, sk, purpose, text, unt, r, tool in DIAG:
             outs.append({"diag": sid, "session": sk, "tool": tool, "score": None if r is None else r["score"],
-                         "window_scores": window_scores(SESS[sk], purpose, text, unt, r)})
+                         "window_scores": window_scores(SESS[sk], purpose, text, unt, r),
+                         "export": feature_export(SESS[sk], purpose, text, unt, r) if EXPORT else None})
         DIAG.clear()
         return outs + [{"id": m["id"], "op": "flush"}]
     return {"id": m.get("id"), "op": "error", "error": "unknown op"}

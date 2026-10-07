@@ -90,6 +90,7 @@ pub fn run(
     let inflight: Inflight = Arc::default();
 
     let (e2, out2, inf2) = (e.clone(), out.clone(), inflight.clone());
+    let (m2, c2) = (mandate.clone(), context.clone());
     let reader = std::thread::spawn(move || {
         for line in from_server.lines().map_while(Result::ok) {
             let mut line = line;
@@ -102,7 +103,7 @@ pub fn run(
                         line = v.to_string();
                     }
                     if let Some(r) = v.get("result") {
-                        e2.observe_output(&tool, &text_of(r));
+                        e2.observe_output_in(&m2, c2.as_ref(), &tool, &text_of(r));
                     }
                 }
             }

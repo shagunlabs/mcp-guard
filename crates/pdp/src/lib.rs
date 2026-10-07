@@ -2,7 +2,16 @@
 //! in shadow or enforce mode, with every decision written to the signed evidence chain.
 use sentryra_sidecar_risk as t2;
 /// Tier 2 session key: one agent session per Edge process (proxy). See README gaps.
-const T2_SESSION: &str = "edge";
+/// Tier 2 state key for a call: per mandate (token digest) and per agent session
+/// (`context.session_id`, if the caller supplies one). No cross-mandate cache sharing.
+pub fn t2_session_key(mandate: &str, context: Option<&bindings::Context>) -> String {
+    let m = hex::encode(&Sha256::digest(mandate.as_bytes())[..12]);
+    let s = context
+        .and_then(|c| c.get("session_id"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("-");
+    format!("m:{m}/s:{s}")
+}
 pub mod bindings;
 pub mod constraints;
 pub mod receipts;
@@ -268,11 +277,24 @@ impl Engine {
     }
 
     /// Record a relayed tool output for taint tracking (only if the tool's output is untrusted).
+    /// Tier 1 taint ingest is unconditional and independent of Tier 2 (availability or verdicts).
     pub fn observe_output(&self, tool: &str, text: &str) {
+        self.observe_output_in("", None, tool, text)
+    }
+
+    /// As `observe_output`, with Tier 2 state keyed by the call's mandate and session.
+    pub fn observe_output_in(
+        &self,
+        mandate: &str,
+        context: Option<&bindings::Context>,
+        tool: &str,
+        text: &str,
+    ) {
         if self.output_untrusted(tool) {
             self.state.lock().unwrap().taint.ingest(text);
             if let Some((c, _)) = &self.tier2 {
-                c.ingest(T2_SESSION, text); // async: embedded in the sidecar, off the response path
+                // async: embedded in the sidecar, off the response path
+                c.ingest(&t2_session_key(mandate, context), text);
             }
         }
     }
@@ -526,8 +548,12 @@ impl Engine {
             if let Some(o) = a.as_object_mut() {
                 o.remove("resource");
             }
-            let (rid, res) = c.score(T2_SESSION, &purpose, &req.tool, class, &resource, &a, *diag);
-            let ap = t2::rules::apply(tier1, class, &res, &c.cfg);
+            let key = t2_session_key(&req.mandate, req.context.as_ref());
+            let (rid, res) = c.score(&key, &purpose, &req.tool, class, &resource, &a, *diag);
+            let ctx = t2::rules::Ctx {
+                untrusted_in_session: c.has_untrusted(&key),
+            };
+            let ap = t2::rules::apply(tier1, class, &res, &c.cfg, ctx);
             let via: Vec<String> = ap.via.iter().map(|v| format!("{v:?}")).collect();
             reasons.push(format!(
                 "tier2: {} req={rid} class={} cfg={} via=[{}] {}",

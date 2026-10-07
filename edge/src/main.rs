@@ -21,7 +21,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
       --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>
-      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
+      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
       [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -62,6 +62,8 @@ struct Opts {
     t2_scorer: Option<PathBuf>,
     t2_python: String,
     t2_deadline_ms: u64,
+    t2_recheck_secs: u64,
+    t2_diag_noprobe: bool,
     t2_log: Option<PathBuf>,
     t2_diag: bool,
     t2_allowlist: Option<PathBuf>,
@@ -79,6 +81,8 @@ fn opts(args: &[String]) -> Opts {
         t2_scorer: None,
         t2_python: "python3".into(),
         t2_deadline_ms: 10,
+        t2_recheck_secs: 60,
+        t2_diag_noprobe: false,
         t2_log: None,
         t2_diag: false,
         t2_allowlist: None,
@@ -110,6 +114,14 @@ fn opts(args: &[String]) -> Opts {
             "--edge-url" => o.edge_url = v(),
             "--tier2-scorer" => o.t2_scorer = Some(v().into()),
             "--tier2-python" => o.t2_python = v(),
+            "--tier2-diagnostic-no-probe" => {
+                o.t2_diag_noprobe = true;
+                i += 1;
+                continue;
+            }
+            "--tier2-recheck-secs" => {
+                o.t2_recheck_secs = v().parse().unwrap_or_else(|_| die("--tier2-recheck-secs"))
+            }
             "--tier2-deadline-ms" => {
                 o.t2_deadline_ms = v().parse().unwrap_or_else(|_| die("--tier2-deadline-ms"))
             }
@@ -196,6 +208,7 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
         threshold: sc.threshold,
         near_margin: sc.near_margin,
         deadline_ms: o.t2_deadline_ms,
+        recheck_secs: o.t2_recheck_secs,
     };
     let sock = std::env::temp_dir().join(format!("sentryra-t2-{}.sock", std::process::id()));
     let c = match client::Client::spawn(client::SpawnOpts {
@@ -208,6 +221,7 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
         cfg: rcfg,
         scorer_config: sc.clone(),
         scorer_config_path: cfg_path,
+        diagnostic_no_probe: o.t2_diag_noprobe,
     }) {
         Ok(c) => {
             eprintln!(
@@ -222,7 +236,9 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
             client::Client::dead(rcfg, sc.config_version.clone(), e.0)
         }
     };
-    e.set_tier2(Arc::new(c), o.t2_diag);
+    let c = Arc::new(c);
+    c.start_recheck(); // periodic probe re-check through the same FIFO queue
+    e.set_tier2(c, o.t2_diag);
 }
 
 fn main() {
