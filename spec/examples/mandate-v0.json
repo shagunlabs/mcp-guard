@@ -1,0 +1,34 @@
+{
+  "mandate_id": "mdt_01JA2Z6Q4K8P2",
+  "spec": "sentryra.mandate/v0",
+  "tenant": "org_acme",
+  "issuer": {"kid": "acme-root-2026-10", "alg": "Ed25519"},
+  "principal": {
+    "type": "user", "id": "priya@acme.com",
+    "idp": "entra", "idp_subject": "00u1a2b3", "acr": "phr",
+    "consent": {"method": "webauthn", "at": "2026-10-07T12:31:04Z"}
+  },
+  "agent": {
+    "id": "agt_deploybot", "instance": "run_7f3a",
+    "idp": "entra-agent-id", "agent_identity_oid": "9d3f...", "blueprint_app_id": "5c1e...",
+    "cnf": {"jwk_thumbprint": "NzbLsXh8uDCcd-6MNwXF4W_7noWXFZAfHkxZsRGC9Xs"}
+  },
+  "purpose": "Roll out billing-service v2.14 to staging; production only after SRE approval.",
+  "scopes": [
+    {"tool": "github.create_pull_request", "resource": "repo:acme/billing-service", "effect": "allow"},
+    {"tool": "github.merge_pull_request", "resource": "repo:acme/billing-service", "effect": "escalate", "approvers": ["group:sre-oncall"]},
+    {"tool": "k8s.apply", "resource": "cluster:staging/ns:billing", "effect": "allow"},
+    {"tool": "k8s.apply", "resource": "cluster:prod/ns:billing", "effect": "escalate", "approvers": ["group:sre-oncall"]},
+    {"tool": "postgres.query", "resource": "db:billing", "effect": "allow",
+     "constraints": {"sql.statement_types": ["SELECT"], "max_rows": 1000}},
+    {"tool": "slack.post_message", "resource": "channel:#billing-deploys", "effect": "allow",
+     "constraints": {"untainted_args": ["channel"]}}
+  ],
+  "default_effect": "deny",
+  "limits": {"max_calls": 200, "rate": "30/min", "max_spend": {"amount": 0, "currency": "INR"}},
+  "context_constraints": {"source_cidrs": ["10.20.0.0/16"], "hours": "Mon-Fri 09:00-20:00 Asia/Kolkata"},
+  "delegation": {"may_delegate": true, "max_depth": 1},
+  "risk_profile": "production-change",
+  "not_before": "2026-10-07T12:30:00Z",
+  "expires_at": "2026-10-07T20:30:00Z"
+}

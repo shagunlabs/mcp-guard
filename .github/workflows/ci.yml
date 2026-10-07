@@ -1,0 +1,31 @@
+# Not run remotely yet (no remote configured). Security gates per tech-stack.md §3.
+name: ci
+on: [push, pull_request]
+permissions: { contents: read }
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # pin to full SHA before first remote run
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "rustfmt, clippy" }
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace --locked
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo install --locked cargo-deny cargo-audit
+      - run: cargo deny check
+      - run: cargo audit
+      - name: secret scan
+        uses: gitleaks/gitleaks-action@v2
+  terraform:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=deploy/terraform fmt -check -recursive
+      - run: terraform -chdir=deploy/terraform init -backend=false && terraform -chdir=deploy/terraform validate

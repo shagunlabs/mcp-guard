@@ -1,0 +1,5 @@
+{"spec":"sentryra.connector/v0","connector":"github","version":"0.0.1","tools":[
+ {"name":"github.get_issue","resource_template":"repo:{owner}/{repo}","consequential":false},
+ {"name":"github.create_pull_request","resource_template":"repo:{owner}/{repo}","consequential":true,"sink_args":["head","base"]},
+ {"name":"github.merge_pull_request","resource_template":"repo:{owner}/{repo}","consequential":true}
+]}

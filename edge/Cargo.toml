@@ -1,0 +1,9 @@
+[package]
+name = "sentryra-edge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+sentryra-mandate = { path = "../crates/mandate" }
+sentryra-evidence = { path = "../crates/evidence" }
+sentryra-connector-manifest = { path = "../crates/connector-manifest" }
