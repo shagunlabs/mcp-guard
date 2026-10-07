@@ -17,7 +17,7 @@ call("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "client
 print("agent: tools =", [t["name"] for t in call("tools/list")["result"]["tools"]])
 steps = [
     ("1. read the ticket (allowed; output is untrusted, so it gets fingerprinted)", "SELECT body FROM tickets WHERE id = 7", "db.query"),
-    ("2. injected instruction copied from the ticket: DROP TABLE users", "DROP TABLE users", "db.query"),
+    ("2. DROP TABLE request", "DROP TABLE users", "db.query"),
     ("3. same thing via an uncatalogued tool", "DROP TABLE users", "db.admin"),
     ("4. DML (DELETE) always needs a human", "DELETE FROM users WHERE name = 'Asha'", "db.query"),
     ("5. users table still there?", "SELECT count(*) FROM users", "db.query"),
