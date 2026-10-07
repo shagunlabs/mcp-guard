@@ -81,6 +81,9 @@ pub struct ScoreResponse {
     pub windows_read: Option<Value>,
     #[serde(default)]
     pub windows_total: Option<Value>,
+    /// Window filter only: windows the filter skipped (each one counts as unread).
+    #[serde(default)]
+    pub windows_skipped: Option<Value>,
     #[serde(default)]
     pub model_version: Option<String>,
     #[serde(default)]
@@ -96,5 +99,11 @@ impl ScoreResponse {
                 .and_then(|x| x.as_i64().filter(|_| x.is_i64() || x.is_u64()))
         };
         (i(&self.windows_read), i(&self.windows_total))
+    }
+    /// `windows_skipped` as an integer; missing or non-integer => None.
+    pub fn skipped(&self) -> Option<i64> {
+        self.windows_skipped
+            .as_ref()
+            .and_then(|x| x.as_i64().filter(|_| x.is_i64() || x.is_u64()))
     }
 }

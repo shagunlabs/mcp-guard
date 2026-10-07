@@ -100,6 +100,11 @@ impl Client {
             } else {
                 vec![]
             })
+            .args(if o.cfg.window_filter {
+                vec!["--window-filter"]
+            } else {
+                vec![]
+            })
             .args(if o.feature_export && Self::dev_export_compiled() {
                 vec!["--feature-export"]
             } else {
@@ -151,6 +156,19 @@ impl Client {
                 "scorer config {:?} != {}",
                 hello.get("config_version"),
                 c.config_version
+            )));
+        }
+        // The scorer must run in the same window-filter mode as the Edge (else skips go unreported).
+        if hello
+            .get("window_filter")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            != o.cfg.window_filter
+        {
+            return Err(ClientError(format!(
+                "scorer window_filter {:?} != Edge {}",
+                hello.get("window_filter"),
+                o.cfg.window_filter
             )));
         }
         if hello.get("determinism_ok") != Some(&json!(true)) {
@@ -450,7 +468,7 @@ impl Client {
             self.waiters.lock().unwrap().remove(&id);
             return (id, T2Result::Unavailable);
         }
-        match rx.recv_timeout(Duration::from_millis(self.cfg.deadline_ms)) {
+        match rx.recv_timeout(Duration::from_millis(self.cfg.deadline_for(class))) {
             Ok(r) => match serde_json::from_value::<ScoreResponse>(r) {
                 Ok(s) => (id, T2Result::Scored(Box::new(s))),
                 Err(_) => (id, T2Result::Unavailable),
@@ -508,6 +526,15 @@ mod t {
     }
     /// Single-threaded like the real server: one FIFO queue in front of one inference session.
     fn fake_probe(delay_ms: u64, ingest_ms: u64, reply: Value, probe_ok: bool) -> Client {
+        fake_cfg(delay_ms, ingest_ms, reply, probe_ok, Config::default())
+    }
+    fn fake_cfg(
+        delay_ms: u64,
+        ingest_ms: u64,
+        reply: Value,
+        probe_ok: bool,
+        cfg: Config,
+    ) -> Client {
         let p =
             std::env::temp_dir().join(format!("t2fake{}-{}.sock", std::process::id(), rand_id()));
         let _ = std::fs::remove_file(&p);
@@ -541,7 +568,7 @@ mod t {
             }
         });
         let s = UnixStream::connect(&p).unwrap();
-        Client::from_stream(s, Config::default(), "x".into(), None).unwrap()
+        Client::from_stream(s, cfg, "x".into(), None).unwrap()
     }
     fn rand_id() -> u64 {
         std::time::SystemTime::now()
@@ -576,6 +603,43 @@ mod t {
             "{r:?}"
         );
         assert!(t.elapsed() < Duration::from_millis(35), "{:?}", t.elapsed());
+    }
+    #[test]
+    fn send_deadline_applies_to_external_send_only() {
+        let cfg = Config {
+            send_deadline_ms: Some(400),
+            ..Config::default()
+        };
+        let c = fake_cfg(40, 0, ok_reply(), true, cfg);
+        let (_, r) = c.score(
+            "s",
+            "p",
+            "mail.send",
+            SideEffect::ExternalSend,
+            "r",
+            &json!({}),
+            false,
+        );
+        assert!(matches!(r, T2Result::Scored(_)), "{r:?}");
+        // every other class keeps the 10 ms deadline
+        let (_, r) = c.score(
+            "s",
+            "p",
+            "db.write",
+            SideEffect::Write,
+            "r",
+            &json!({}),
+            false,
+        );
+        assert!(
+            matches!(
+                r,
+                T2Result::Timeout {
+                    cache_not_ready: false
+                }
+            ),
+            "{r:?}"
+        );
     }
     #[test]
     fn scored_within_deadline() {

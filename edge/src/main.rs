@@ -24,7 +24,8 @@ const USAGE: &str = "usage: sentryra-edge <command>
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
       --policies <file.cedar> (default: compiled-in) --evidence <file.jsonl> (default: <keydir>/evidence.jsonl; --no-evidence to disable) --revoked <id,...> --edge-url <url>
       --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-dev-export (dev-export builds only; fixture mandates only)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
-      [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
+      [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)
+      PROTOTYPE, off by default: [--tier2-window-filter (score only windows traceable to untrusted output; skipped windows = T2_PARTIAL_READ)] [--tier2-send-deadline-ms <ms> (external_send only; other classes keep --tier2-deadline-ms)]";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("error: {msg}");
@@ -65,6 +66,8 @@ struct Opts {
     t2_scorer: Option<PathBuf>,
     t2_python: String,
     t2_deadline_ms: u64,
+    t2_window_filter: bool,
+    t2_send_deadline_ms: Option<u64>,
     t2_recheck_secs: u64,
     t2_diag_noprobe: bool,
     t2_dev_export: bool,
@@ -86,6 +89,8 @@ fn opts(args: &[String]) -> Opts {
         t2_scorer: None,
         t2_python: "python3".into(),
         t2_deadline_ms: 10,
+        t2_window_filter: false,
+        t2_send_deadline_ms: None,
         t2_recheck_secs: 60,
         t2_diag_noprobe: false,
         t2_dev_export: false,
@@ -143,6 +148,17 @@ fn opts(args: &[String]) -> Opts {
             }
             "--tier2-deadline-ms" => {
                 o.t2_deadline_ms = v().parse().unwrap_or_else(|_| die("--tier2-deadline-ms"))
+            }
+            "--tier2-window-filter" => {
+                o.t2_window_filter = true;
+                i += 1;
+                continue;
+            }
+            "--tier2-send-deadline-ms" => {
+                o.t2_send_deadline_ms = Some(
+                    v().parse()
+                        .unwrap_or_else(|_| die("--tier2-send-deadline-ms")),
+                )
             }
             "--tier2-config" => o.t2_config = Some(v().into()),
             "--tier2-log" => o.t2_log = Some(v().into()),
@@ -240,6 +256,8 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
         near_margin: sc.near_margin,
         deadline_ms: o.t2_deadline_ms,
         recheck_secs: o.t2_recheck_secs,
+        window_filter: o.t2_window_filter,
+        send_deadline_ms: o.t2_send_deadline_ms,
     };
     let sock = std::env::temp_dir().join(format!("sentryra-t2-{}.sock", std::process::id()));
     let c = match client::Client::spawn(client::SpawnOpts {
@@ -257,8 +275,8 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
     }) {
         Ok(c) => {
             eprintln!(
-                "[sentryra] tier2 scorer up: config {} model sha256:{} deadline {} ms threshold {}",
-                sc.config_version, c.model_digest, o.t2_deadline_ms, sc.threshold
+                "[sentryra] tier2 scorer up: config {} model sha256:{} deadline {} ms (external_send {} ms) threshold {} window_filter {}",
+                sc.config_version, c.model_digest, o.t2_deadline_ms, rcfg.deadline_for(sentryra_sidecar_risk::types::SideEffect::ExternalSend), sc.threshold, o.t2_window_filter
             );
             c
         }

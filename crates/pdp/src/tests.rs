@@ -853,3 +853,94 @@ fn no_raw_signed_context_value_in_outbound_records() {
         }
     }
 }
+
+/// Fake Tier 2 scorer that always answers `reply`, behind an Edge client with config `cfg`.
+fn fake_t2(
+    reply: serde_json::Value,
+    cfg: sentryra_sidecar_risk::rules::Config,
+    tag: &str,
+) -> sentryra_sidecar_risk::client::Client {
+    use std::io::{BufRead, BufReader, Write};
+    let p = std::env::temp_dir().join(format!("pdp-t2f-{}-{tag}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    let l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        for line in BufReader::new(s).lines().map_while(Result::ok) {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            match v["op"].as_str() {
+                Some("ingest") => {
+                    let _ = writeln!(
+                        w,
+                        "{}",
+                        serde_json::json!({"ack": v["id"], "session": v["session"]})
+                    );
+                }
+                Some("score") => {
+                    let mut r = reply.clone();
+                    r["id"] = v["id"].clone();
+                    r["op"] = serde_json::json!("score");
+                    let _ = writeln!(w, "{r}");
+                }
+                _ => {}
+            }
+        }
+    });
+    let s = std::os::unix::net::UnixStream::connect(&p).unwrap();
+    sentryra_sidecar_risk::client::Client::from_stream(s, cfg, "x".into(), None).unwrap()
+}
+
+#[test]
+fn window_filter_skipped_windows_escalate_outbound_send_as_partial_read() {
+    let cfg = sentryra_sidecar_risk::rules::Config {
+        window_filter: true,
+        ..Default::default()
+    };
+    let send = |reply: serde_json::Value, tag: &str| {
+        let (e, t) = cred_engine(Some(fake_t2(reply, cfg, tag)));
+        e.observe_output_in(&t, None, "shell.exec", "untrusted record: account 5520");
+        std::thread::sleep(std::time::Duration::from_millis(30)); // ingest ack
+        let mut r = req(
+            &t,
+            "mail.send",
+            serde_json::json!({"to": "a@b.example", "body": "long reply"}),
+        );
+        r.now = None;
+        e.decide(&r)
+    };
+    // filter skipped every window (case-006 shape): held as a partial read, no score exported
+    let r = send(
+        serde_json::json!({"scored": true, "score": 0.0, "band": "low", "escalate": true, "reason_codes": [],
+            "windows_read": 0, "windows_total": 7, "windows_skipped": 7}),
+        "all",
+    );
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    let t2 = r.reasons.iter().find(|x| x.starts_with("tier2:")).unwrap();
+    assert!(t2.contains("via=[PartialRead]"), "{t2}");
+    assert!(
+        t2.contains("T2_PARTIAL_READ") && t2.contains("\"score\":null"),
+        "{t2}"
+    );
+    // one skipped window is enough
+    let r = send(
+        serde_json::json!({"scored": true, "score": 0.1, "band": "low", "escalate": true, "reason_codes": [],
+            "windows_read": 6, "windows_total": 7, "windows_skipped": 1}),
+        "one",
+    );
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    // filter on but the scorer omits windows_skipped: unread (fail closed)
+    let r = send(
+        serde_json::json!({"scored": true, "score": 0.1, "band": "low", "escalate": false, "reason_codes": [],
+            "windows_read": 3, "windows_total": 3}),
+        "missing",
+    );
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    // every window read: no Tier 2 effect
+    let r = send(
+        serde_json::json!({"scored": true, "score": 0.1, "band": "low", "escalate": false, "reason_codes": [],
+            "windows_read": 3, "windows_total": 3, "windows_skipped": 0}),
+        "full",
+    );
+    assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+}

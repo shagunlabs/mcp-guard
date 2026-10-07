@@ -17,6 +17,7 @@ ap.add_argument("--socket", required=True)
 ap.add_argument("--expect-sha256", required=True)
 ap.add_argument("--config", required=True, help="versioned scorer config (scorer version + weights ref + threshold)")
 ap.add_argument("--feature-export", action="store_true", help="DEV/HELDOUT: include full feature export in diag flush")
+ap.add_argument("--window-filter", action="store_true", help="PROTOTYPE: score only windows traceable to untrusted output; skipped windows are reported (windows_skipped) and count as unread")
 ap.add_argument("--diagnostic-no-probe", action="store_true", help="DIAGNOSTIC ONLY: skip the probe check (score-only pass)")
 a = ap.parse_args()
 sys.path.insert(0, a.scorer_dir)
@@ -45,8 +46,18 @@ EXPORT = a.feature_export   # only passed by an Edge built with the dev-export f
 CFG_ID = CFG["config_version"] + ("+diag-noprobe" if a.diagnostic_no_probe else "")
 
 
-def new_scorer():
-    return scorer.Tier2Scorer(W=W, encoder=ENC, threshold=THR, config=KEY)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import t2_window_filter as WF  # noqa: E402
+SCORER_CLS = WF.filtered(scorer, scorer.Tier2Scorer) if a.window_filter else scorer.Tier2Scorer
+
+
+def new_scorer(cls=None):
+    return (cls or SCORER_CLS)(W=W, encoder=ENC, threshold=THR, config=KEY)
+
+
+def selected(ws, untrusted, purpose):
+    """Windows the active scorer reads (budget selector, or the window filter)."""
+    return WF.traceable(scorer, ws, untrusted, purpose) if a.window_filter else scorer.select(ws, untrusted, purpose)
 
 
 ENC = scorer.Encoder(model)                          # the one and only INT8 session
@@ -79,7 +90,7 @@ def self_check():
     tol = min(float(CFG["probe_tolerance"]), float(ref.get("tolerance", CFG["probe_tolerance"])))
     out, ok = [], bool(ref.get("probes"))
     for pr in ref.get("probes", []):
-        sc = new_scorer()                            # fresh state per probe, same INT8 session
+        sc = new_scorer(scorer.Tier2Scorer)          # fresh state per probe, same INT8 session; never filtered
         for u in pr.get("untrusted", []):
             sc.ingest(u)
         r = sc.score_call(pr["purpose"], "send_email", "external_send", "mailto:probe@example.invalid", {"body": pr["outbound"]})
@@ -122,7 +133,7 @@ def window_scores(sc, purpose, text, untrusted, resp):
     if set(resp["reason_codes"]) & {scorer.RC_FRAG, scorer.RC_PLACEHOLDER}:
         return [resp["score"]]
     ws, _ = scorer.windows(ENC, text)
-    idx = scorer.select(ws, untrusted, purpose)
+    idx = selected(ws, untrusted, purpose)
     tmp = _snap(sc, untrusted)
     tmp.cfg = dict(tmp.cfg, pooling="pooled")       # one window at a time = per-window features
     out = []
@@ -138,12 +149,15 @@ def feature_export(sc, purpose, text, untrusted, resp):
     if text is None:
         return {"text": None, "scored": resp is not None}
     ws, ntok = scorer.windows(ENC, text)
-    idx = scorer.select(ws, untrusted, purpose)
+    idx = selected(ws, untrusted, purpose)
     tmp = _snap(sc, untrusted)
     dec = None
     if resp is not None and not (set(resp["reason_codes"]) & {scorer.RC_FRAG, scorer.RC_PLACEHOLDER}):
-        f, r, t = tmp._features(purpose, text)
-        dec = {"features": f, "score": round(scorer.score_from_features(f, tmp.W), 6), "windows_read": r, "windows_total": t}
+        try:
+            f, r, t = tmp._features(purpose, text)
+            dec = {"features": f, "score": round(scorer.score_from_features(f, tmp.W), 6), "windows_read": r, "windows_total": t}
+        except WF._NothingRead as e:   # window filter skipped every window
+            dec = {"features": None, "score": None, "windows_read": 0, "windows_total": e.total}
     per = []
     pw = _snap(sc, untrusted); pw.cfg = dict(pw.cfg, pooling="pooled")
     for i, w in enumerate(ws):
@@ -161,7 +175,7 @@ def handle(m):
     op = m.get("op")
     if op == "hello":
         return {"id": m["id"], "op": "hello", "model_digest": scorer.MODEL_DIGEST, "model_version": scorer.MODEL_VERSION, "model_id": scorer.MODEL_ID,
-                "config_version": CFG_ID, "determinism_ok": DET_OK, "determinism": DET}
+                "config_version": CFG_ID, "window_filter": bool(a.window_filter), "determinism_ok": DET_OK, "determinism": DET}
     if op == "probe" and a.diagnostic_no_probe:
         return {"id": m["id"], "op": "probe", "determinism_ok": True, "determinism": DET}
     if op == "probe":   # periodic re-check, queued FIFO behind scoring on the one INT8 session

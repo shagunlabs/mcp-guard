@@ -36,6 +36,13 @@ pub struct Config {
     pub deadline_ms: u64,
     /// Periodic probe re-check interval through the same scorer queue (0 = off).
     pub recheck_secs: u64,
+    /// PROTOTYPE, off by default (`--tier2-window-filter`): the scorer reads only windows that
+    /// hold content traceable to untrusted output seen in the session. Every skipped window
+    /// counts as unread: `T2_PARTIAL_READ` is recorded and an outbound send escalates.
+    pub window_filter: bool,
+    /// PROTOTYPE, off by default (`--tier2-send-deadline-ms`): separate deadline for
+    /// `external_send` calls. `None` = `deadline_ms` for every class.
+    pub send_deadline_ms: Option<u64>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -44,8 +51,40 @@ impl Default for Config {
             near_margin: 0.03,
             deadline_ms: 10,
             recheck_secs: 60,
+            window_filter: false,
+            send_deadline_ms: None,
         }
     }
+}
+impl Config {
+    /// Deadline for one call of this class. Only `external_send` can have its own deadline;
+    /// every other class keeps `deadline_ms`.
+    pub fn deadline_for(&self, class: SideEffect) -> u64 {
+        match (class, self.send_deadline_ms) {
+            (SideEffect::ExternalSend, Some(ms)) => ms,
+            _ => self.deadline_ms,
+        }
+    }
+}
+
+/// Windows the scorer did not read. With the window filter on, the scorer must report
+/// `windows_skipped` and `read + skipped == total`; anything missing, malformed or inconsistent
+/// counts as unread (fail closed). With the filter off, a reported skip still counts.
+fn skipped_windows(s: &ScoreResponse, cfg: &Config) -> bool {
+    let (r, t) = s.windows();
+    let k = s.skipped();
+    if let Some(k) = k {
+        if k != 0 {
+            return true;
+        }
+    }
+    if cfg.window_filter {
+        return match (r, t, k) {
+            (Some(r), Some(t), Some(k)) => r < 0 || k < 0 || r + k != t || r < t,
+            _ => true,
+        };
+    }
+    false
 }
 
 /// What the transport produced for one call.
@@ -169,8 +208,13 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                 }
             }
             Some(x) => {
-                score = Some(x);
-                band = s.band.clone();
+                windows = s.windows();
+                // Nothing read (filter skipped every window): the number is not a score.
+                let none_read = matches!(windows.0, Some(0));
+                if !none_read {
+                    score = Some(x);
+                    band = s.band.clone();
+                }
                 for c in &s.reason_codes {
                     if EXPORTABLE.contains(&c.as_str()) {
                         push(&mut codes, c);
@@ -192,13 +236,14 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                         &mut via,
                     );
                 }
-                windows = s.windows();
+                let skipped = skipped_windows(s, cfg);
                 // Mandatory partial-read rule for outbound sends (Edge-side, A1 §2).
                 if class == SideEffect::ExternalSend {
-                    let partial = match windows {
-                        (Some(r), Some(t)) => r < t,
-                        _ => true, // missing or non-integer => unread
-                    };
+                    let partial = skipped
+                        || match windows {
+                            (Some(r), Some(t)) => r < t,
+                            _ => true, // missing or non-integer => unread
+                        };
                     if partial {
                         esc |= fl(
                             T2_PARTIAL_READ,
@@ -208,6 +253,9 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                             &mut via,
                         );
                     }
+                } else if cfg.window_filter && skipped {
+                    // Filter skipped windows on a non-send sink: recorded, no escalation.
+                    push(&mut codes, T2_PARTIAL_READ);
                 }
             }
         },
@@ -237,6 +285,12 @@ mod t {
         near_margin: 0.03,
         deadline_ms: 10,
         recheck_secs: 60,
+        window_filter: false,
+        send_deadline_ms: None,
+    };
+    const F: Config = Config {
+        window_filter: true,
+        ..C
     };
     const U: Ctx = Ctx {
         untrusted_in_session: true,
@@ -506,6 +560,122 @@ mod t {
                 assert_eq!(a.outcome, Allow, "{c:?}");
                 assert!(!a.tier2_escalate);
             }
+        }
+    }
+
+    fn fresp(score: f64, read: i64, total: i64, skipped: serde_json::Value) -> T2Result {
+        T2Result::Scored(Box::new(ScoreResponse {
+            scored: true,
+            score: Some(score),
+            band: Some("low".into()),
+            windows_read: Some(json!(read)),
+            windows_total: Some(json!(total)),
+            windows_skipped: if skipped.is_null() {
+                None
+            } else {
+                Some(skipped)
+            },
+            ..Default::default()
+        }))
+    }
+    #[test]
+    fn window_filter_off_by_default() {
+        let d = Config::default();
+        assert!(!d.window_filter);
+        assert_eq!(d.send_deadline_ms, None);
+        // filter off + no windows_skipped field: behaviour exactly as before
+        let a = apply(
+            Allow,
+            ExternalSend,
+            &resp(0.10, &[], json!(3), json!(3)),
+            &d,
+            U,
+        );
+        assert_eq!(a.outcome, Allow);
+        assert!(a.codes.is_empty());
+    }
+    #[test]
+    fn filter_skipped_window_is_partial_read_and_send_escalates() {
+        let a = apply(Allow, ExternalSend, &fresp(0.05, 2, 7, json!(5)), &F, U);
+        assert_eq!(a.outcome, Escalate);
+        assert!(a.tier2_escalate);
+        assert_eq!(a.codes, vec![T2_PARTIAL_READ.to_string()]);
+        assert_eq!(a.via, vec![Via::PartialRead]); // a coverage hold, not a score catch
+        assert_eq!(a.score, Some(0.05));
+    }
+    #[test]
+    fn filter_one_skipped_window_is_enough() {
+        let a = apply(Allow, ExternalSend, &fresp(0.0, 6, 7, json!(1)), &F, U);
+        assert_eq!(a.outcome, Escalate);
+        assert!(a.codes.contains(&T2_PARTIAL_READ.to_string()));
+    }
+    #[test]
+    fn filter_skipped_every_window_escalates_without_a_score() {
+        let a = apply(Allow, ExternalSend, &fresp(0.0, 0, 7, json!(7)), &F, U);
+        assert_eq!(a.outcome, Escalate);
+        assert_eq!(a.via, vec![Via::PartialRead]);
+        assert_eq!(a.score, None, "nothing was read: no score is exported");
+        assert_eq!(a.band, None);
+        assert_eq!(a.export()["score"], json!(null));
+    }
+    #[test]
+    fn filter_skip_or_bad_counts_override_a_full_read_claim() {
+        // read == total but the scorer reports a skip, or the counts don't add up, or the
+        // skip count is missing / not an integer: all unread (fail closed).
+        for (r, t, k) in [
+            (7, 7, json!(2)),
+            (5, 7, json!(0)),
+            (7, 7, json!(null)),
+            (7, 7, json!("0")),
+            (7, 7, json!(0.0)),
+            (7, 7, json!(-1)),
+        ] {
+            let a = apply(Allow, ExternalSend, &fresp(0.05, r, t, k.clone()), &F, U);
+            assert_eq!(a.outcome, Escalate, "{r}/{t} skipped {k}");
+            assert!(
+                a.codes.contains(&T2_PARTIAL_READ.to_string()),
+                "{r}/{t} {k}"
+            );
+        }
+    }
+    #[test]
+    fn filter_full_read_has_no_effect() {
+        let a = apply(Allow, ExternalSend, &fresp(0.05, 3, 3, json!(0)), &F, U);
+        assert_eq!(a.outcome, Allow);
+        assert!(a.codes.is_empty());
+    }
+    #[test]
+    fn reported_skip_counts_even_with_filter_off() {
+        let a = apply(Allow, ExternalSend, &fresp(0.05, 3, 3, json!(1)), &C, U);
+        assert_eq!(a.outcome, Escalate);
+        assert!(a.codes.contains(&T2_PARTIAL_READ.to_string()));
+    }
+    #[test]
+    fn filter_skip_on_non_send_is_recorded_not_escalated() {
+        let a = apply(Allow, Write, &fresp(0.05, 1, 3, json!(2)), &F, U);
+        assert_eq!(a.outcome, Allow);
+        assert!(!a.tier2_escalate);
+        assert_eq!(a.codes, vec![T2_PARTIAL_READ.to_string()]);
+        assert!(a.via.is_empty());
+    }
+    #[test]
+    fn filter_skip_is_escalate_only() {
+        for t1 in [Deny, Escalate] {
+            for c in [Read, Write, ExternalSend, Destructive, Privilege] {
+                assert_eq!(apply(t1, c, &fresp(0.0, 0, 7, json!(7)), &F, U).outcome, t1);
+            }
+        }
+    }
+    #[test]
+    fn send_deadline_only_changes_external_send() {
+        assert_eq!(C.deadline_for(ExternalSend), 10);
+        let s = Config {
+            send_deadline_ms: Some(50),
+            ..C
+        };
+        assert_eq!(s.deadline_for(ExternalSend), 50);
+        for c in [Read, Write, Destructive, Privilege] {
+            assert_eq!(s.deadline_for(c), 10, "{c:?}");
         }
     }
 }
