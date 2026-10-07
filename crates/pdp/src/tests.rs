@@ -945,20 +945,15 @@ fn window_filter_skipped_windows_escalate_outbound_send_as_partial_read() {
     assert_eq!(r.decision, "allow", "{:?}", r.reasons);
 }
 
-/// Tier 1 only (no Tier 2 attached): a signed mandate binds `mail.recipients` to the signed
-/// `ticket.requester`. The send may go to that address and nowhere else; with no trusted value the
-/// binding is unresolved and the send escalates; a requester value supplied through agent
-/// arguments or untrusted tool output never resolves the binding.
-#[test]
-fn mail_recipients_bound_to_signed_requester() {
-    const REQ: &str = "req@cust.example";
-    const OTHER: &str = "other@elsewhere.example";
-    const EVIL: &str = "attacker@evil.example";
+/// Support-mail engine for the `mail.recipients` binding tests: `ticket.read` (untrusted output)
+/// and `mail.send` (external_send) with catalogue-declared args `mail_args`. Tier 2 is not attached.
+/// Returns (engine, token with signed `ticket.requester`, token with no context).
+fn bound_send_engine(mail_args: serde_json::Value) -> (Engine, String, String) {
     let root = KeyPair::new();
     let cat = SigningKey::generate(&mut rand::rngs::OsRng);
     let man = serde_json::json!({"spec":"sentryra.connector/v0","connector":"support","version":"0.0.1","tools":[
         {"name":"ticket.read","resource_template":"tickets","consequential":false,"output_trust":"untrusted","sink_args":[],"side_effect_class":"read"},
-        {"name":"mail.send","resource_template":"mail","consequential":true,"output_trust":"trusted","sink_args":["to","cc","bcc","body"],"side_effect_class":"external_send"}
+        {"name":"mail.send","resource_template":"mail","consequential":true,"output_trust":"trusted","sink_args":["to","cc","bcc","body"],"side_effect_class":"external_send","args":mail_args}
     ]}).to_string().into_bytes();
     let sig = hex::encode(cat.sign(&man).to_bytes());
     let e = Engine::new(Config {
@@ -1002,6 +997,25 @@ fn mail_recipients_bound_to_signed_requester() {
         "mdt_bound",
     );
     let unsigned = tok(None, "mdt_unbound");
+    (e, signed, unsigned)
+}
+
+const REQ: &str = "req@cust.example";
+const OTHER: &str = "other@elsewhere.example";
+const EVIL: &str = "attacker@evil.example";
+
+fn mail_args_declared() -> serde_json::Value {
+    serde_json::json!({"to": "email", "cc": "email", "bcc": "email", "from": "email",
+        "body": "text", "subject": "text"})
+}
+
+/// Tier 1 only (no Tier 2 attached): a signed mandate binds `mail.recipients` to the signed
+/// `ticket.requester`. The send may go to that address and nowhere else; with no trusted value the
+/// binding is unresolved and the send escalates; a requester value supplied through agent
+/// arguments or untrusted tool output never resolves the binding.
+#[test]
+fn mail_recipients_bound_to_signed_requester() {
+    let (e, signed, unsigned) = bound_send_engine(mail_args_declared());
     let send = |t: &str, args: serde_json::Value| {
         let r = e.decide(&req(t, "mail.send", args));
         assert!(
@@ -1118,4 +1132,140 @@ fn mail_recipients_bound_to_signed_requester() {
     denied_by_binding(&r, "after injection");
     let r = send(&signed, serde_json::json!({"to": REQ, "body": body}));
     assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+}
+
+/// `mail.recipients` fails closed when the recipient is not in a recognised recipient field
+/// (Tier 1 only). Chosen behaviour for addresses in unrecognised fields: an address NOT in the
+/// list denies (same as `to`); an address that IS in the list still escalates (the field is not a
+/// recognised recipient field). Free-text `body` / `subject` are content, not routing: ignored.
+#[test]
+fn mail_recipients_fail_closed_without_recognised_recipient_field() {
+    let (e, signed, unsigned) = bound_send_engine(mail_args_declared());
+    let send = |t: &str, args: serde_json::Value| {
+        let r = e.decide(&req(t, "mail.send", args));
+        assert!(
+            !r.reasons.iter().any(|x| x.starts_with("tier2:")),
+            "Tier 2 must not act: {:?}",
+            r.reasons
+        );
+        r
+    };
+    let has = |r: &DecideResponse, s: &str| r.reasons.iter().any(|x| x.contains(s));
+    const NO_FIELD: &str = "constraint: mail.recipients set but no recipient field found";
+    let body = "Your refund has been issued.";
+
+    // 1. only an unknown field (`address`, `target`) or no recipient field at all: escalate.
+    for args in [
+        serde_json::json!({"address": REQ, "body": body}),
+        serde_json::json!({"target": REQ, "body": body}),
+        serde_json::json!({"target": "crm:contact/42", "body": body}),
+        serde_json::json!({"body": body}),
+        serde_json::json!({}),
+        serde_json::json!({"to": [], "body": body}),
+    ] {
+        for t in [&signed, &unsigned] {
+            let r = send(t, args.clone());
+            assert_eq!(r.decision, "escalate", "{args}: {:?}", r.reasons);
+        }
+        let r = send(&signed, args.clone());
+        assert!(has(&r, NO_FIELD), "{args}: {:?}", r.reasons);
+    }
+    //    ... and an unknown field carrying a NON-listed address is denied outright (stricter).
+    for f in ["address", "target"] {
+        let r = send(&signed, serde_json::json!({f: OTHER, "body": body}));
+        assert_eq!(r.decision, "deny", "{f}: {:?}", r.reasons);
+        assert!(
+            has(&r, "holds an address not in mail.recipients"),
+            "{:?}",
+            r.reasons
+        );
+    }
+
+    // 2. an extra unknown field holding an address never lets the send slip through.
+    for (extra, v) in [
+        ("forward_to", serde_json::json!(OTHER)),
+        (
+            "forward_to",
+            serde_json::json!(format!("Other Person <{}>", OTHER.to_uppercase())),
+        ),
+        ("forward_to", serde_json::json!([REQ, OTHER])),
+        ("callback", serde_json::json!(format!("mailto:{OTHER}"))),
+        ("routing", serde_json::json!({"next": {"hop": OTHER}})),
+        ("notify", serde_json::json!(format!("{REQ}, {OTHER}"))),
+        ("title", serde_json::json!(format!("fwd to {OTHER} please"))),
+    ] {
+        let r = send(
+            &signed,
+            serde_json::json!({"to": REQ, extra: v, "body": body}),
+        );
+        assert_eq!(r.decision, "deny", "{extra}={v}: {:?}", r.reasons);
+        assert!(
+            has(
+                &r,
+                &format!("`{extra}` holds an address not in mail.recipients")
+            ),
+            "{:?}",
+            r.reasons
+        );
+    }
+    //    the requester's own address in an unrecognised field: held for approval, not allowed.
+    let r = send(
+        &signed,
+        serde_json::json!({"to": REQ, "forward_to": REQ, "body": body}),
+    );
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(has(
+        &r,
+        "`forward_to` holds an address but is not a recognised recipient field"
+    ));
+    //    free-text content (body / subject, declared `text`) mentioning an address is not routing.
+    let r = send(
+        &signed,
+        serde_json::json!({"to": REQ, "subject": format!("Re: {OTHER}"),
+            "body": format!("Please contact {OTHER} for returns.")}),
+    );
+    assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+
+    // 3. `from` stays a checked recipient field: a non-listed sender address is denied.
+    let r = send(
+        &signed,
+        serde_json::json!({"to": REQ, "from": "support@acme.example", "body": body}),
+    );
+    assert_eq!(r.decision, "deny", "{:?}", r.reasons);
+    assert!(
+        has(&r, "`from` value not in mail.recipients"),
+        "{:?}",
+        r.reasons
+    );
+
+    // 4. catalogue declares mail.send as external_send with NO email-kind args: escalate even for
+    //    the signed requester in `to` (and non-listed addresses still deny).
+    let (e2, signed2, _) = bound_send_engine(serde_json::json!({"body": "text"}));
+    let r = e2.decide(&req(
+        &signed2,
+        "mail.send",
+        serde_json::json!({"to": REQ, "body": body}),
+    ));
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(
+        has(
+            &r,
+            "catalogue declares no recipient (email) argument for outbound send `mail.send`"
+        ),
+        "{:?}",
+        r.reasons
+    );
+    let r = e2.decide(&req(
+        &signed2,
+        "mail.send",
+        serde_json::json!({"to": OTHER, "body": body}),
+    ));
+    assert_eq!(r.decision, "deny", "{:?}", r.reasons);
+    let (e3, signed3, _) = bound_send_engine(serde_json::json!({}));
+    let r = e3.decide(&req(
+        &signed3,
+        "mail.send",
+        serde_json::json!({"to": REQ, "body": body}),
+    ));
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
 }

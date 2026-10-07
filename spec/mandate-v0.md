@@ -19,7 +19,7 @@ Scope `constraints` use these dotted keys (adopted from the ML team's bench v0.2
 | `repo.numbers` | list | `number`, `pr`, `issue` | exact allowlist |
 | `repo.permissions` | list | `permission`, `role` | exact allowlist |
 | `mail.recipient_domains` | list | every `email` arg (`to`, `cc`, `bcc`, `email`, …) | domain equals or is a subdomain; non-ASCII (homoglyph) domains denied |
-| `mail.recipients` | list | every `email` arg | exact address (case-insensitive) |
+| `mail.recipients` | list | every `email` arg (incl. `from`), plus every non-`email`, non-`text` arg for address-shaped values | exact address (case-insensitive, trimmed). Fail closed: no `email` arg with a value in the call, or catalogue `external_send` tool declaring no `email` arg => escalate; an address not in the list in any other arg (e.g. `forward_to`, nested, `mailto:`) => deny; a listed address in a non-recipient field => escalate. Free-text `text` args (`body`) are content and ignored |
 | `mail.query` | list | `q`, `query` | exact allowlist |
 | `shell.cmd_prefix` | list | `cmd` args | command equals a prefix or starts with `prefix `; shell metacharacters ``; \| & ` $ < > ( ) { } \`` and newlines denied |
 | `amount.max` | number | `amount` args | 0 ≤ value ≤ max; numeric strings accepted |

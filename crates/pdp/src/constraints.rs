@@ -130,6 +130,130 @@ fn args_of_kind<'a>(
         .unwrap_or_default()
 }
 
+/// Whether `s` (already stripped of brackets/quotes/`mailto:`) is shaped like an email address.
+fn email_shaped(s: &str) -> bool {
+    let Some((local, domain)) = s.rsplit_once('@') else {
+        return false;
+    };
+    !local.is_empty()
+        && !domain.is_empty()
+        && local
+            .chars()
+            .all(|c| c.is_alphanumeric() || ".!#$%&'*+/=?^_`{|}~-".contains(c))
+        && domain
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '-' || c == '.')
+        && !domain.starts_with(['.', '-'])
+}
+
+/// Address-shaped tokens embedded anywhere in one string, normalised (trimmed, lowercased,
+/// `mailto:` removed). Handles `Name <a@b>`, `a@b, c@d`, `mailto:a@b`, quoted forms.
+fn address_tokens(s: &str) -> Vec<String> {
+    s.split(|c: char| c.is_whitespace() || ",;<>\"'()[]".contains(c))
+        .map(|t| {
+            let t = t.trim().to_lowercase();
+            t.strip_prefix("mailto:").map(String::from).unwrap_or(t)
+        })
+        .filter(|t| email_shaped(t))
+        .collect()
+}
+
+/// Every address-shaped string anywhere in `v` (nested arrays / objects included).
+fn addresses_in(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.extend(address_tokens(s)),
+        Value::Array(a) => a.iter().for_each(|x| addresses_in(x, out)),
+        Value::Object(o) => o.values().for_each(|x| addresses_in(x, out)),
+        _ => {}
+    }
+}
+
+/// `mail.recipients` (exact-address allowlist). Fail closed on every shape a recipient can hide in:
+/// - unresolved `$binding`: escalate;
+/// - catalogue declares the tool `external_send` but declares no `email` argument: escalate;
+/// - no recipient (`email`-kind) argument with a value in the call: escalate;
+/// - each `email`-kind argument: every value must be in the list, else deny (`from` included);
+/// - any OTHER argument (not `email`, not free `text` such as `body`, which is content rather
+///   than routing) holding an address-shaped value anywhere (e.g. `forward_to`, `target`,
+///   `subject`, nested objects, `mailto:` URLs): an address not in the list denies; an address in
+///   the list still escalates, because the field is not a recognised recipient field. Such a call
+///   is never allowed through.
+fn mail_recipients(o: &mut Outcome, val: &Value, args: &Value, def: Option<&ToolDef>) {
+    let allowed_raw = list(val);
+    let unresolved = allowed_raw
+        .iter()
+        .any(|a| a.as_str().is_some_and(|s| s.starts_with('$')));
+    if unresolved {
+        o.escalate(
+            "constraint: `mail.recipients` uses a context binding the Edge cannot resolve yet"
+                .into(),
+        );
+        return;
+    }
+    if let Some(d) = def {
+        if d.side_effect_class.as_deref() == Some("external_send")
+            && !d.args.values().any(|k| *k == ArgKind::Email)
+        {
+            o.escalate(format!(
+                "constraint: mail.recipients set but catalogue declares no recipient (email) argument for outbound send `{}`",
+                d.name
+            ));
+        }
+    }
+    let allowed: Vec<String> = allowed_raw
+        .iter()
+        .map(|a| match a {
+            Value::String(s) => s.trim().to_lowercase(),
+            x => x.to_string(),
+        })
+        .collect();
+    let targets = args_of_kind(args, def, &[ArgKind::Email]);
+    let n_values: usize = targets
+        .iter()
+        .map(|(_, v)| match v {
+            Value::Null => 0,
+            x => list(x).len(),
+        })
+        .sum();
+    if n_values == 0 {
+        o.escalate("constraint: mail.recipients set but no recipient field found".into());
+    }
+    for (an, v) in &targets {
+        let ok = list(v).iter().all(|x| {
+            x.as_str()
+                .is_some_and(|s| allowed.contains(&s.trim().to_lowercase()))
+        });
+        if ok {
+            o.vouched.insert((*an).clone());
+        } else {
+            o.deny(format!("constraint: `{an}` value not in mail.recipients"));
+        }
+    }
+    let empty = serde_json::Map::new();
+    for (an, v) in args.as_object().unwrap_or(&empty) {
+        let kind = def
+            .map(|d| d.kind_of(an))
+            .unwrap_or_else(|| ArgKind::infer(an));
+        if kind == ArgKind::Email || kind.is_free_text() {
+            continue;
+        }
+        let mut found = vec![];
+        addresses_in(v, &mut found);
+        if found.is_empty() {
+            continue;
+        }
+        if found.iter().any(|a| !allowed.contains(a)) {
+            o.deny(format!(
+                "constraint: `{an}` holds an address not in mail.recipients"
+            ));
+        } else {
+            o.escalate(format!(
+                "constraint: `{an}` holds an address but is not a recognised recipient field"
+            ));
+        }
+    }
+}
+
 /// Rules that apply whether or not the mandate has constraints.
 pub fn baseline(args: &Value, def: Option<&ToolDef>) -> Outcome {
     let mut o = Outcome::new();
@@ -328,15 +452,12 @@ pub fn eval(
                     }
                 }
             }
-            "mail.recipients" | "idp.users" | "mail.query" | "repo.numbers"
-            | "repo.permissions" | "chat.channels" | "idp.groups" | "db.tenants"
-            | "deploy.regions" | "deploy.builds" | "amount.currency" => {
+            "mail.recipients" => mail_recipients(&mut o, val, args, def),
+            "idp.users" | "mail.query" | "repo.numbers" | "repo.permissions" | "chat.channels"
+            | "idp.groups" | "db.tenants" | "deploy.regions" | "deploy.builds"
+            | "amount.currency" => {
                 let allowed = list(val);
-                let targets: Vec<(&String, &Value)> = if k == "mail.recipients" {
-                    args_of_kind(args, def, &[ArgKind::Email])
-                } else {
-                    by_names(k)
-                };
+                let targets: Vec<(&String, &Value)> = by_names(k);
                 if allowed
                     .iter()
                     .any(|a| a.as_str().is_some_and(|s| s.starts_with('$')))
@@ -488,6 +609,50 @@ mod tests {
             ),
             Verdict::Pass
         );
+    }
+    #[test]
+    fn recipients_fail_closed() {
+        let c = json!({"mail.recipients": ["req@c.example"]});
+        assert_eq!(v(c.clone(), json!({"to": " REQ@c.example"})), Verdict::Pass);
+        assert_eq!(v(c.clone(), json!({"body": "hi"})), Verdict::Escalate);
+        assert_eq!(v(c.clone(), json!({})), Verdict::Escalate);
+        assert_eq!(v(c.clone(), json!({"to": []})), Verdict::Escalate);
+        assert_eq!(
+            v(c.clone(), json!({"address": "req@c.example"})),
+            Verdict::Escalate
+        );
+        assert_eq!(
+            v(c.clone(), json!({"target": "x@evil.example"})),
+            Verdict::Deny
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "req@c.example", "forward_to": "x@evil.example"})
+            ),
+            Verdict::Deny
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "req@c.example", "forward_to": "req@c.example"})
+            ),
+            Verdict::Escalate
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "req@c.example", "body": "cc x@evil.example"})
+            ),
+            Verdict::Pass
+        );
+        assert_eq!(
+            v(c, json!({"to": "req@c.example", "from": "s@acme.example"})),
+            Verdict::Deny
+        );
+        assert!(address_tokens("Bob <B@X.example>, mailto:c@y.example").len() == 2);
+        assert!(address_tokens("https://user@host/x").is_empty());
+        assert!(address_tokens("no address here @ all").is_empty());
     }
     #[test]
     fn amounts() {
