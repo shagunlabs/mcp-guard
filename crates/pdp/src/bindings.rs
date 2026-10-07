@@ -9,6 +9,26 @@ use serde_json::{Map, Value};
 
 pub type Context = Map<String, Value>;
 
+/// Flatten nested objects into dotted keys: `{"ticket": {"requester": x}}` -> `ticket.requester`.
+fn flatten(prefix: &str, v: &Value, out: &mut Context) {
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o {
+                let key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                flatten(&key, x, out);
+            }
+        }
+        _ if !prefix.is_empty() => {
+            out.insert(prefix.to_string(), v.clone());
+        }
+        _ => {}
+    }
+}
+
 /// Merge trusted context: mandate first (signed), then host context for keys the mandate lacks.
 pub fn merge(mandate: &Context, host: Option<&Context>, principal: &str) -> Context {
     let mut c = Context::new();
@@ -16,13 +36,9 @@ pub fn merge(mandate: &Context, host: Option<&Context>, principal: &str) -> Cont
         c.insert("principal.id".into(), Value::String(principal.into()));
     }
     if let Some(h) = host {
-        for (k, v) in h {
-            c.insert(k.clone(), v.clone());
-        }
+        flatten("", &Value::Object(h.clone()), &mut c);
     }
-    for (k, v) in mandate {
-        c.insert(k.clone(), v.clone());
-    }
+    flatten("", &Value::Object(mandate.clone()), &mut c);
     c.retain(|_, v| usable(v));
     c
 }
@@ -110,6 +126,18 @@ mod t {
         assert_eq!(c["ticket.requester"], "signed@x");
         assert_eq!(c["session.user"], "s1");
         assert_eq!(c["principal.id"], "p@x");
-        assert!(!c.contains_key("bad") && !c.contains_key("loop"));
+        assert!(!c.contains_key("loop"));
+        assert_eq!(c["bad.o"], 1);
+    }
+    #[test]
+    fn nested_context_flattens() {
+        let m = ctx(json!({"ticket": {"requester": "r@x"}}));
+        let c = merge(&m, None, "");
+        assert_eq!(c["ticket.requester"], "r@x");
+        let r = resolve(
+            &json!({"mail.recipients": ["$ticket.requester", "$ticket.cc"]}),
+            &c,
+        );
+        assert_eq!(r, json!({"mail.recipients": ["r@x", "$ticket.cc"]}));
     }
 }

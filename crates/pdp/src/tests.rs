@@ -446,3 +446,13 @@ fn sql_literals_from_untrusted_text_still_taint() {
     assert!(r.tainted, "{:?}", r.reasons);
     assert_eq!(r.decision, "escalate");
 }
+
+#[test]
+fn nested_signed_context_resolves_and_missing_ref_escalates() {
+    let (e, t) = binding_engine(Some(serde_json::json!({"session": {"tenant": "alice"}})));
+    assert_eq!(e.decide(&breq(&t, "alice", None)).decision, "allow");
+    assert_eq!(e.decide(&breq(&t, "mallory", None)).decision, "deny");
+    // a $-ref with no trusted value still escalates
+    let (e, t) = binding_engine(Some(serde_json::json!({"ticket": {"requester": "bob"}})));
+    assert_eq!(e.decide(&breq(&t, "alice", None)).decision, "escalate");
+}
