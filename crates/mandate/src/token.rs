@@ -77,6 +77,12 @@ pub fn issue(m: &Mandate, root: &KeyPair) -> Result<Biscuit, TokenError> {
         m.not_before,
         m.expires_at
     );
+    if !m.context.is_empty() {
+        code.push_str(&format!(
+            "context({});\n",
+            q(&serde_json::Value::Object(m.context.clone()).to_string())
+        ));
+    }
     for s in &m.scopes {
         let c = s
             .constraints
@@ -157,6 +163,8 @@ pub struct Verified {
     pub agent: String,
     /// The principal's purpose (trusted reference intent).
     pub purpose: String,
+    /// Trusted context from the signed authority block (empty if none).
+    pub context: serde_json::Map<String, serde_json::Value>,
     /// Strictest effect among matching scopes (before constraint evaluation).
     pub effect: Effect,
     /// Every matching scope as (effect, constraints JSON). Constraints are part of the signed authority block.
@@ -234,6 +242,7 @@ pub fn verify(
         principal: one("p($p) <- principal($p)", &mut a)?,
         agent: one("a($a) <- agent($a)", &mut a)?,
         purpose: one("p($p) <- purpose($p)", &mut a)?,
+        context: serde_json::from_str(&one("c($c) <- context($c)", &mut a)?).unwrap_or_default(),
         effect,
         scopes,
     })

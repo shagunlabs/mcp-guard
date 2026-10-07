@@ -132,7 +132,7 @@ pub fn tables(sql: &str) -> Vec<String> {
         if let Token::Word(w) = t {
             if matches!(
                 w.keyword,
-                K::FROM | K::JOIN | K::INTO | K::UPDATE | K::TABLE
+                K::FROM | K::JOIN | K::INTO | K::UPDATE | K::TABLE | K::TRUNCATE
             ) {
                 if let Some(Token::Word(n)) = toks.get(i + 1) {
                     if !matches!(

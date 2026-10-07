@@ -35,6 +35,10 @@ pub struct Mandate {
     pub default_effect: Effect,
     pub not_before: String,
     pub expires_at: String,
+    /// Trusted call context signed into the mandate (e.g. `{"ticket.requester": "a@x"}`), used to
+    /// resolve `$name` bindings in scope constraints. Takes precedence over host-supplied context.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub context: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, PartialEq, Eq)]

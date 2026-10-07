@@ -16,7 +16,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
   attenuate <keydir> <token> <tool> <resource> [expires_at]
   revocation-ids <keydir> <token>
   serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, GET /v1/evidence
-  mcp-proxy <keydir> [opts] -- <server cmd...>  stdio MCP proxy (mandate from $SENTRYRA_MANDATE)
+  mcp-proxy <keydir> [opts] -- <server cmd...>  stdio MCP proxy (mandate from $SENTRYRA_MANDATE, trusted host context JSON from $SENTRYRA_CONTEXT)
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
@@ -239,7 +239,11 @@ fn main() {
             let mandate =
                 std::env::var("SENTRYRA_MANDATE").unwrap_or_else(|_| die("set SENTRYRA_MANDATE"));
             let e = Arc::new(engine(&d, &o));
-            std::process::exit(proxy::run(e, mandate, &o.rest));
+            // Trusted host context for `$` bindings: from the host's environment, never from the agent.
+            let context = std::env::var("SENTRYRA_CONTEXT").ok().map(|c| {
+                serde_json::from_str(&c).unwrap_or_else(|x| die(format!("SENTRYRA_CONTEXT: {x}")))
+            });
+            std::process::exit(proxy::run(e, mandate, context, &o.rest));
         }
         "bench" => {
             let d = need_dir();
@@ -287,6 +291,7 @@ fn bench(dir: &Path, o: &Opts) {
             args: c.clone(),
             now: None,
             receipt: None,
+            context: None,
         });
     }
     let mut lat = Vec::with_capacity(o.n);
@@ -297,6 +302,7 @@ fn bench(dir: &Path, o: &Opts) {
             args: cases[i % cases.len()].clone(),
             now: None,
             receipt: None,
+            context: None,
         };
         let t = std::time::Instant::now();
         std::hint::black_box(e.decide(&r));

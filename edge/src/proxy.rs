@@ -59,13 +59,19 @@ pub fn apply_row_cap(result: &mut Value, cap: usize) -> bool {
             }
         }
     }
-    if cut {
-        result["_meta"]["com.sentryra/row_cap"] = json!({"cap": cap, "truncated": true});
+    // Always annotate when a cap applied, so clients/auditors can see it was enforced.
+    if result.is_object() {
+        result["_meta"]["com.sentryra/row_cap"] = json!({"cap": cap, "truncated": cut});
     }
     cut
 }
 
-pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
+pub fn run(
+    e: Arc<Engine>,
+    mandate: String,
+    context: Option<sentryra_pdp::bindings::Context>,
+    cmd: &[String],
+) -> i32 {
     let mut child = match Command::new(&cmd[0])
         .args(&cmd[1..])
         .stdin(Stdio::piped())
@@ -92,9 +98,8 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
                 let entry = inf2.lock().unwrap().remove(&id);
                 if let Some((tool, cap)) = entry {
                     if let (Some(cap), Some(r)) = (cap, v.get_mut("result")) {
-                        if apply_row_cap(r, cap) {
-                            line = v.to_string();
-                        }
+                        apply_row_cap(r, cap);
+                        line = v.to_string();
                     }
                     if let Some(r) = v.get("result") {
                         e2.observe_output(&tool, &text_of(r));
@@ -129,6 +134,8 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
                     .get("_meta")
                     .and_then(|m| m.get("com.sentryra/receipt"))
                     .and_then(|r| serde_json::from_value(r.clone()).ok()),
+                // host-supplied only; any `_meta` context from the agent is ignored
+                context: context.clone(),
             });
             eprintln!(
                 "[sentryra] {} {} -> {}{} (policies: {}) {}",

@@ -1,5 +1,6 @@
 //! M2 Tier 1 decision core: Biscuit mandate + signed tool catalogue + Cedar + SQL parse + taint,
 //! in shadow or enforce mode, with every decision written to the signed evidence chain.
+pub mod bindings;
 pub mod constraints;
 pub mod receipts;
 pub mod sql;
@@ -40,6 +41,10 @@ pub struct DecideRequest {
     /// Signed approval receipt for a previously escalated identical action.
     #[serde(default)]
     pub receipt: Option<receipts::Receipt>,
+    /// Trusted call context from the host (never from the agent or tool outputs), used to resolve
+    /// `$name` bindings in mandate constraints. The signed mandate `context` wins on conflict.
+    #[serde(default)]
+    pub context: Option<bindings::Context>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -300,6 +305,22 @@ impl Engine {
             .as_ref()
             .map(|v| taint::atoms_of(&v.purpose))
             .unwrap_or_default();
+        // Tables the mandate allows (`sql.tables` in any matching scope) are trusted SQL identifiers:
+        // an allowed table name appearing in untrusted text does not taint a query.
+        let sql_trusted: HashSet<String> = {
+            let mut t = trusted.clone();
+            if let Ok(v) = verified.as_ref() {
+                for (_, c) in &v.scopes {
+                    if let Some(a) = c.get("sql.tables").and_then(|x| x.as_array()) {
+                        t.extend(a.iter().filter_map(|x| x.as_str()).map(|x| {
+                            let x = x.trim().to_lowercase();
+                            x.rsplit('.').next().unwrap_or(&x).to_string()
+                        }));
+                    }
+                }
+            }
+            t
+        };
         // Which string arguments carry values derived from untrusted output seen in this run.
         let tainted_any: HashSet<String> = {
             let st = self.state.lock().unwrap();
@@ -324,7 +345,12 @@ impl Engine {
                                 serde_json::Value::Number(n) => vec![n.to_string()],
                                 _ => vec![],
                             };
-                            vals.iter().any(|s| st.taint.is_tainted(kind, s, &trusted))
+                            let tr = if kind == ArgKind::Sql {
+                                &sql_trusted
+                            } else {
+                                &trusted
+                            };
+                            vals.iter().any(|s| st.taint.is_tainted(kind, s, tr))
                         })
                         .map(|(k, _)| k.clone())
                         .collect()
@@ -343,7 +369,9 @@ impl Engine {
                 }
                 // Each matching scope grants only if its constraints pass; strictest surviving effect wins.
                 let mut best: Option<Effect> = None;
+                let ctx = bindings::merge(&v.context, req.context.as_ref(), &v.principal);
                 for (eff, c) in &v.scopes {
+                    let c = &bindings::resolve(c, &ctx);
                     let o = constraints::eval(c, &req.args, def, &|a| tainted_any.contains(a));
                     reasons.extend(o.reasons.iter().cloned());
                     let e = match o.verdict {

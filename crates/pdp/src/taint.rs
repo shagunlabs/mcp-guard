@@ -269,19 +269,18 @@ fn typed_candidates(kind: ArgKind, v: &str) -> Vec<String> {
         ArgKind::Host => vec![format!("host:{n}"), n],
         ArgKind::Amount => num(&n).into_iter().collect(),
         ArgKind::Sql => {
+            // Table names (the caller drops tables the mandate allows via `sql.tables`) plus
+            // string and number literals. Columns and other identifiers are not taint-checked.
             let mut c: Vec<String> = crate::sql::tables(v);
-            // identifiers too (exact match), so a table named in a statement the parser rejects still counts
-            const KW: &[&str] = &[
-                "select", "from", "where", "and", "or", "not", "insert", "into", "values",
-                "update", "set", "delete", "drop", "table", "truncate", "alter", "create", "count",
-                "join", "on", "as", "limit", "order", "by", "group", "having", "null", "is", "in",
-                "like",
-            ];
             c.extend(
-                v.split(|ch: char| !(ch.is_alphanumeric() || ch == '_' || ch == '.'))
-                    .map(|w| w.to_lowercase())
-                    .filter(|w| {
-                        !w.is_empty() && !KW.contains(&w.as_str()) && w.parse::<f64>().is_err()
+                v.split(|ch: char| !(ch.is_ascii_digit() || ch == '.' || ch == '-'))
+                    .filter_map(num)
+                    // 0..=99 (LIMIT 1, id = 1, ...) carry no provenance signal inside a statement
+                    .filter(|n| {
+                        let n = n.trim_start_matches("num:");
+                        n.contains('.')
+                            || n.parse::<f64>()
+                                .map_or(true, |x| !(0.0..100.0).contains(&x))
                     }),
             );
             // string literals
@@ -412,6 +411,23 @@ mod t {
         ));
         assert!(s.is_tainted(ArgKind::Sql, "SELECT 1; TRUNCATE audit_log_pm44", &none()));
         assert!(!s.is_tainted(ArgKind::Sql, "SELECT count(*) FROM orders", &none()));
+        // columns are not checked; literals are
+        s.ingest("customer note: lifetime_value_x9 and code 'promo_zz71' and 4017.33");
+        assert!(!s.is_tainted(
+            ArgKind::Sql,
+            "SELECT lifetime_value_x9 FROM orders",
+            &none()
+        ));
+        assert!(s.is_tainted(
+            ArgKind::Sql,
+            "SELECT * FROM orders WHERE code = 'promo_zz71'",
+            &none()
+        ));
+        assert!(s.is_tainted(
+            ArgKind::Sql,
+            "SELECT * FROM orders WHERE total = 4017.330",
+            &none()
+        ));
     }
     #[test]
     fn decoding_passes() {
