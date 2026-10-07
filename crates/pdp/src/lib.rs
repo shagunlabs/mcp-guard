@@ -9,7 +9,7 @@ use cedar_policy::{
     Authorizer, Context, Decision as CDecision, Entities, EntityUid, PolicySet, Request,
 };
 use ed25519_dalek::{Signature, SigningKey, Verifier, VerifyingKey};
-use sentryra_connector_manifest::{Manifest, ToolDef, Trust};
+use sentryra_connector_manifest::{ArgKind, Manifest, ToolDef, Trust};
 use sentryra_evidence::{Chain, Entry, NewEntry};
 use sentryra_mandate::{token, Effect};
 use serde::{Deserialize, Serialize};
@@ -54,6 +54,8 @@ pub struct DecideResponse {
     pub reasons: Vec<String>,
     pub policy_ids: Vec<String>,
     pub tainted: bool,
+    /// Result obligations from the granting scopes, e.g. `row_cap=100` (enforced by the proxy).
+    pub obligations: Vec<String>,
     /// For escalations: the only thing that leaves the Edge is the decision ID + this deep link.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approval_link: Option<String>,
@@ -285,22 +287,44 @@ impl Engine {
         let mut reasons = vec![];
 
         // Mandate (Biscuit): signature, revocation, expiry, attenuation; then signed scope constraints.
-        // Which string arguments carry fingerprints of untrusted output seen in this run.
+        let verified = token::verify(
+            &req.mandate,
+            self.root,
+            &self.revoked,
+            &req.tool,
+            &resource,
+            &now,
+        );
+        // Trusted text (the principal's purpose) never counts as taint.
+        let trusted: HashSet<String> = verified
+            .as_ref()
+            .map(|v| taint::atoms_of(&v.purpose))
+            .unwrap_or_default();
+        // Which string arguments carry values derived from untrusted output seen in this run.
         let tainted_any: HashSet<String> = {
             let st = self.state.lock().unwrap();
             req.args
                 .as_object()
                 .map(|o| {
                     o.iter()
-                        .filter(|(_, v)| {
-                            let vals: Vec<&str> = match v {
-                                serde_json::Value::Array(a) => {
-                                    a.iter().filter_map(|x| x.as_str()).collect()
-                                }
-                                serde_json::Value::String(s) => vec![s.as_str()],
+                        .filter(|(k, v)| {
+                            let kind = def
+                                .map(|d| d.kind_of(k))
+                                .unwrap_or_else(|| ArgKind::infer(k));
+                            let vals: Vec<String> = match v {
+                                serde_json::Value::Array(a) => a
+                                    .iter()
+                                    .map(|x| {
+                                        x.as_str()
+                                            .map(String::from)
+                                            .unwrap_or_else(|| x.to_string())
+                                    })
+                                    .collect(),
+                                serde_json::Value::String(s) => vec![s.clone()],
+                                serde_json::Value::Number(n) => vec![n.to_string()],
                                 _ => vec![],
                             };
-                            vals.iter().any(|s| st.taint.is_tainted(s))
+                            vals.iter().any(|s| st.taint.is_tainted(kind, s, &trusted))
                         })
                         .map(|(k, _)| k.clone())
                         .collect()
@@ -308,17 +332,11 @@ impl Engine {
                 .unwrap_or_default()
         };
         let mut ddl_mandated = false;
+        let mut obligations: Vec<String> = vec![];
         let base = constraints::baseline(&req.args, def);
         reasons.extend(base.reasons.iter().cloned());
         let mut vouched: HashSet<String> = HashSet::new();
-        let (mandate_id, principal, mut mandate_effect) = match token::verify(
-            &req.mandate,
-            self.root,
-            &self.revoked,
-            &req.tool,
-            &resource,
-            &now,
-        ) {
+        let (mandate_id, principal, mut mandate_effect) = match verified {
             Ok(v) => {
                 if v.scopes.is_empty() {
                     reasons.push("mandate: no scope for this tool/resource (default deny)".into());
@@ -334,6 +352,7 @@ impl Engine {
                         _ => *eff,
                     };
                     vouched.extend(o.vouched);
+                    obligations.extend(o.obligations);
                     ddl_mandated |= o.ddl_ok;
                     best = Some(best.map_or(e, |b| stricter(b, e)));
                 }
@@ -374,9 +393,16 @@ impl Engine {
         if sql.parse_error {
             reasons.push("sql: does not parse (fail closed)".into());
         }
-        // Taint is only relevant for sink arguments declared in the signed manifest.
-        // (Uncatalogued tools are escalated anyway.)
-        let sinks: Vec<String> = def.map(|d| d.sink_args.clone()).unwrap_or_default();
+        // Sinks: the arguments declared in the signed manifest; uncatalogued tools default to
+        // "every argument is a sink".
+        let sinks: Vec<String> = match def {
+            Some(d) => d.sink_args.clone(),
+            None => req
+                .args
+                .as_object()
+                .map(|o| o.keys().cloned().collect())
+                .unwrap_or_default(),
+        };
         let tainted_args: Vec<String> = sinks
             .iter()
             .filter(|k| tainted_any.contains(*k))
@@ -501,6 +527,7 @@ impl Engine {
             reasons,
             policy_ids,
             tainted: !tainted_args.is_empty(),
+            obligations,
             approval_link,
             evidence_seq: seq,
             entry_hash,

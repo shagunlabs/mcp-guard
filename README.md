@@ -64,3 +64,11 @@ This is a box-local micro-benchmark, not a published number: no WAL fsync, no gR
 
 ## Repository
 Planned home `github.com/shagunlabs/sentryra` (org name **placeholder, to be confirmed**). No remote configured; nothing pushed.
+
+## Taint matching (v0.3)
+- Typed sinks (table, recipient, branch, amount, host, path, channel, group, id, URL, cmd, SQL; from manifest `args` or inferred from the name) match exact normalized atoms with no length minimum. URLs are parsed into host/path/query; paths match on segment suffixes; shell `$VAR` sigils are stripped; SQL matches tables, identifiers and literals.
+- The length/entropy minimum applies only to free-text args; tokens from the mandate `purpose` are trusted and excluded.
+- Decoding passes (URL-encoding, base64 std/url-safe, hex; two levels) run on outbound args before matching.
+- Uncatalogued tools: every argument is a sink (they also escalate as destructive).
+- `max_rows` is enforced on results at the proxy: JSON arrays (or `{rows:[...]}`) are truncated, other text by line; `_meta["com.sentryra/row_cap"]` marks the cut.
+- Mandate scope resources support globs (`*` within a segment, `**` across segments).

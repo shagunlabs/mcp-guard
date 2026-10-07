@@ -20,6 +20,51 @@ fn text_of(result: &Value) -> String {
         .unwrap_or_default()
 }
 
+type Inflight = Arc<Mutex<HashMap<String, (String, Option<usize>)>>>;
+
+/// Enforce a `row_cap` obligation on a tools/call result: every text part that is a JSON array (or
+/// an object with a `rows` array) is truncated to `cap` rows; non-JSON text is truncated to `cap`
+/// non-empty lines. Returns true if anything was cut. The cut is flagged in `_meta`.
+pub fn apply_row_cap(result: &mut Value, cap: usize) -> bool {
+    let mut cut = false;
+    if let Some(parts) = result.get_mut("content").and_then(|c| c.as_array_mut()) {
+        for p in parts.iter_mut() {
+            let Some(t) = p.get("text").and_then(|t| t.as_str()).map(String::from) else {
+                continue;
+            };
+            let new = match serde_json::from_str::<Value>(&t) {
+                Ok(Value::Array(mut a)) if a.len() > cap => {
+                    a.truncate(cap);
+                    Some(Value::Array(a).to_string())
+                }
+                Ok(Value::Object(mut o))
+                    if o.get("rows")
+                        .and_then(|r| r.as_array())
+                        .is_some_and(|r| r.len() > cap) =>
+                {
+                    if let Some(Value::Array(r)) = o.get_mut("rows") {
+                        r.truncate(cap);
+                    }
+                    Some(Value::Object(o).to_string())
+                }
+                Ok(_) => None,
+                Err(_) => {
+                    let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+                    (lines.len() > cap).then(|| lines[..cap].join("\n"))
+                }
+            };
+            if let Some(n) = new {
+                p["text"] = Value::String(n);
+                cut = true;
+            }
+        }
+    }
+    if cut {
+        result["_meta"]["com.sentryra/row_cap"] = json!({"cap": cap, "truncated": true});
+    }
+    cut
+}
+
 pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
     let mut child = match Command::new(&cmd[0])
         .args(&cmd[1..])
@@ -36,14 +81,21 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
     let mut to_server = child.stdin.take().unwrap();
     let from_server = BufReader::new(child.stdout.take().unwrap());
     let out = Arc::new(Mutex::new(std::io::stdout()));
-    let inflight: Arc<Mutex<HashMap<String, String>>> = Arc::default();
+    let inflight: Inflight = Arc::default();
 
     let (e2, out2, inf2) = (e.clone(), out.clone(), inflight.clone());
     let reader = std::thread::spawn(move || {
         for line in from_server.lines().map_while(Result::ok) {
-            if let Ok(v) = serde_json::from_str::<Value>(&line) {
+            let mut line = line;
+            if let Ok(mut v) = serde_json::from_str::<Value>(&line) {
                 let id = v.get("id").map(|i| i.to_string()).unwrap_or_default();
-                if let Some(tool) = inf2.lock().unwrap().remove(&id) {
+                let entry = inf2.lock().unwrap().remove(&id);
+                if let Some((tool, cap)) = entry {
+                    if let (Some(cap), Some(r)) = (cap, v.get_mut("result")) {
+                        if apply_row_cap(r, cap) {
+                            line = v.to_string();
+                        }
+                    }
                     if let Some(r) = v.get("result") {
                         e2.observe_output(&tool, &text_of(r));
                     }
@@ -103,7 +155,13 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
                 continue;
             }
             if let Some(id) = v.get("id") {
-                inflight.lock().unwrap().insert(id.to_string(), tool);
+                let cap = d
+                    .obligations
+                    .iter()
+                    .filter_map(|o| o.strip_prefix("row_cap="))
+                    .filter_map(|n| n.parse().ok())
+                    .min();
+                inflight.lock().unwrap().insert(id.to_string(), (tool, cap));
             }
         }
         if writeln!(to_server, "{line}")
@@ -116,4 +174,21 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
     drop(to_server);
     let _ = reader.join();
     child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn row_cap_truncates() {
+        let mut r = json!({"content": [{"type": "text", "text": "[[1],[2],[3]]"}]});
+        assert!(apply_row_cap(&mut r, 2));
+        assert_eq!(r["content"][0]["text"], "[[1],[2]]");
+        assert_eq!(r["_meta"]["com.sentryra/row_cap"]["truncated"], true);
+        let mut r = json!({"content": [{"type": "text", "text": "a\nb\nc"}]});
+        assert!(apply_row_cap(&mut r, 1));
+        assert_eq!(r["content"][0]["text"], "a");
+        let mut r = json!({"content": [{"type": "text", "text": "[[1]]"}]});
+        assert!(!apply_row_cap(&mut r, 5));
+    }
 }

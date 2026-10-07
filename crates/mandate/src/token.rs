@@ -132,11 +132,31 @@ mod hex {
     }
 }
 
+/// Resource glob: `*` within a `/` segment, `**` across segments; everything else literal.
+pub fn resource_matches(pat: &str, s: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) if p.get(1) == Some(&b'*') => {
+                (0..=s.len()).any(|i| go(&p[2..], &s[i..]))
+            }
+            (Some(b'*'), _) => (0..=s.len())
+                .take_while(|&i| i == 0 || s[i - 1] != b'/')
+                .any(|i| go(&p[1..], &s[i..])),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pat.as_bytes(), s.as_bytes())
+}
+
 #[derive(Debug, Clone)]
 pub struct Verified {
     pub mandate_id: String,
     pub principal: String,
     pub agent: String,
+    /// The principal's purpose (trusted reference intent).
+    pub purpose: String,
     /// Strictest effect among matching scopes (before constraint evaluation).
     pub effect: Effect,
     /// Every matching scope as (effect, constraints JSON). Constraints are part of the signed authority block.
@@ -177,8 +197,15 @@ pub fn verify(
         let v: Vec<(String,)> = a.query(rule)?;
         Ok(v.into_iter().next().map(|x| x.0).unwrap_or_default())
     };
-    let rows: Vec<(String, String)> =
-        a.query(format!("e($e, $c) <- scope({}, {}, $e, $c)", q(tool), q(resource)).as_str())?;
+    // Scope resources may be globs (`repo:acme/*`, `url:*`): `*` matches within one `/` segment,
+    // `**` across segments. Matching happens here, over scopes from the signed authority block.
+    let all: Vec<(String, String, String)> =
+        a.query(format!("e($r, $e, $c) <- scope({}, $r, $e, $c)", q(tool)).as_str())?;
+    let rows: Vec<(String, String)> = all
+        .into_iter()
+        .filter(|(r, _, _)| resource_matches(r, resource))
+        .map(|(_, e, c)| (e, c))
+        .collect();
     let to_eff = |e: &str| match e {
         "allow" => Effect::Allow,
         "escalate" => Effect::Escalate,
@@ -206,6 +233,7 @@ pub fn verify(
         mandate_id: one("m($m) <- mandate($m)", &mut a)?,
         principal: one("p($p) <- principal($p)", &mut a)?,
         agent: one("a($a) <- agent($a)", &mut a)?,
+        purpose: one("p($p) <- purpose($p)", &mut a)?,
         effect,
         scopes,
     })
@@ -257,6 +285,16 @@ mod tests {
                 .effect,
             Effect::Deny
         );
+    }
+    #[test]
+    fn resource_globs() {
+        assert!(resource_matches("repo:acme/*", "repo:acme/billing"));
+        assert!(!resource_matches("repo:acme/*", "repo:acme/billing/x"));
+        assert!(!resource_matches("repo:acme/*", "repo:acmex/billing"));
+        assert!(resource_matches("url:*", "url:api.example"));
+        assert!(resource_matches("fs:/app/**", "fs:/app/a/b"));
+        assert!(resource_matches("db:billing", "db:billing"));
+        assert!(!resource_matches("db:billing", "db:billing2"));
     }
     #[test]
     fn wrong_root_key_rejected() {

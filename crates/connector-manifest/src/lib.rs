@@ -40,6 +40,9 @@ pub enum ArgKind {
     Sql,
     User,
     Group,
+    Table,
+    Channel,
+    Id,
     Region,
     Text,
     Other,
@@ -86,6 +89,26 @@ impl ArgKind {
             "assignee",
         ]) {
             ArgKind::User
+        } else if is(&["table", "tables", "table_name"]) {
+            ArgKind::Table
+        } else if is(&["channel", "channel_id", "chat"]) {
+            ArgKind::Channel
+        } else if is(&[
+            "repo",
+            "repository",
+            "file_id",
+            "charge",
+            "id",
+            "ticket",
+            "issue",
+            "pr",
+            "number",
+            "tenant",
+            "tenant_id",
+            "build",
+            "version",
+        ]) {
+            ArgKind::Id
         } else if is(&["group", "team", "role", "permission", "policy"]) {
             ArgKind::Group
         } else if is(&["region", "regions", "zone", "cluster"]) {
@@ -106,6 +129,11 @@ impl ArgKind {
         }
     }
     /// Kinds where copying attacker-controlled data is dangerous by default (exfil / control targets).
+    /// Free-text kinds get fuzzy (shingle) taint matching with length/entropy minimums.
+    /// Every other kind is "typed": exact normalised matching, no length minimum.
+    pub fn is_free_text(self) -> bool {
+        matches!(self, ArgKind::Text)
+    }
     pub fn is_default_sink(self) -> bool {
         matches!(
             self,
