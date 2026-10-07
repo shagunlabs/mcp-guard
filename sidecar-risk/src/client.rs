@@ -54,6 +54,8 @@ pub struct SpawnOpts {
     /// DIAGNOSTIC ONLY (score-only pass for a config without probe refs): skip the probe check.
     /// The config version is then recorded as `<id>+diag-noprobe`; never for enforcement.
     pub diagnostic_no_probe: bool,
+    /// DEV ONLY: allow per-call feature export (ignored unless built with `dev-export`).
+    pub feature_export: bool,
 }
 
 impl Client {
@@ -69,7 +71,10 @@ impl Client {
                 o.scorer_config.config_version, o.scorer_config.model_sha256
             )));
         }
-        if let (Some(f), Some(pin)) = (&o.scorer_config.weights_file, &o.scorer_config.weights_sha256) {
+        if let (Some(f), Some(pin)) = (
+            &o.scorer_config.weights_file,
+            &o.scorer_config.weights_sha256,
+        ) {
             let w = allowlist::sha256_file(&o.scorer_dir.join(f))
                 .map_err(|e| ClientError(format!("weights: {e:?}")))?;
             if &w != pin {
@@ -90,7 +95,16 @@ impl Client {
             .arg(&digest)
             .arg("--config")
             .arg(&o.scorer_config_path)
-            .args(if o.diagnostic_no_probe { vec!["--diagnostic-no-probe"] } else { vec![] })
+            .args(if o.diagnostic_no_probe {
+                vec!["--diagnostic-no-probe"]
+            } else {
+                vec![]
+            })
+            .args(if o.feature_export && Self::dev_export_compiled() {
+                vec!["--feature-export"]
+            } else {
+                vec![]
+            })
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -285,7 +299,9 @@ impl Client {
 
     /// Why Tier 2 is unavailable right now (refused to start, or a failed periodic re-check).
     pub fn unavailable(&self) -> Option<String> {
-        self.dead.clone().or_else(|| self.health.lock().unwrap().clone())
+        self.dead
+            .clone()
+            .or_else(|| self.health.lock().unwrap().clone())
     }
 
     /// One probe re-check through the same FIFO queue as scoring (one shared INT8 session).
@@ -303,7 +319,8 @@ impl Client {
         if !ok {
             let why = format!(
                 "periodic probe re-check failed: {}",
-                r.and_then(|v| v.get("determinism").cloned()).unwrap_or(json!("no reply"))
+                r.and_then(|v| v.get("determinism").cloned())
+                    .unwrap_or(json!("no reply"))
             );
             eprintln!("[sentryra] tier2 UNAVAILABLE (fail closed): {why}");
             *self.health.lock().unwrap() = Some(why);
@@ -338,6 +355,37 @@ impl Client {
     }
 
     /// Score one call within the deadline. Returns the request id (for the data-plane log) too.
+    /// True only in builds with the `dev-export` cargo feature (never release artifacts).
+    pub const fn dev_export_compiled() -> bool {
+        cfg!(feature = "dev-export")
+    }
+
+    /// As `score`, optionally asking for the DEV feature export of this call. The request is
+    /// dropped unless the build has `dev-export`; the caller must also have checked the fixture marker.
+    #[allow(clippy::too_many_arguments)]
+    pub fn score_ex(
+        &self,
+        session: &str,
+        purpose: &str,
+        tool: &str,
+        class: SideEffect,
+        resource: &str,
+        args: &Value,
+        diag: bool,
+        export: bool,
+    ) -> (u64, T2Result) {
+        self.score_inner(
+            session,
+            purpose,
+            tool,
+            class,
+            resource,
+            args,
+            diag,
+            export && Self::dev_export_compiled(),
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn score(
         &self,
@@ -348,6 +396,21 @@ impl Client {
         resource: &str,
         args: &Value,
         diag: bool,
+    ) -> (u64, T2Result) {
+        self.score_inner(session, purpose, tool, class, resource, args, diag, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn score_inner(
+        &self,
+        session: &str,
+        purpose: &str,
+        tool: &str,
+        class: SideEffect,
+        resource: &str,
+        args: &Value,
+        diag: bool,
+        export: bool,
     ) -> (u64, T2Result) {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let req = ScoreRequest {
@@ -363,6 +426,10 @@ impl Client {
         let mut v = serde_json::to_value(&req).unwrap();
         if diag {
             v["diag"] = json!(true);
+        }
+        if export {
+            v["diag"] = json!(true);
+            v["export"] = json!(true);
         }
         if self.unavailable().is_some() {
             return (id, T2Result::Unavailable);
@@ -463,7 +530,11 @@ mod t {
                         let _ = writeln!(w, "{r}");
                     }
                     Some("probe") => {
-                        let _ = writeln!(w, "{}", json!({"id": v["id"], "op": "probe", "determinism_ok": probe_ok, "determinism": "fake"}));
+                        let _ = writeln!(
+                            w,
+                            "{}",
+                            json!({"id": v["id"], "op": "probe", "determinism_ok": probe_ok, "determinism": "fake"})
+                        );
                     }
                     _ => {}
                 }
@@ -562,20 +633,53 @@ mod t {
         let c = Arc::new(fake(8, 0, ok_reply()));
         let c2 = c.clone();
         let h = std::thread::spawn(move || {
-            c2.score("a", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false).1
+            c2.score(
+                "a",
+                "p",
+                "mail.send",
+                SideEffect::ExternalSend,
+                "r",
+                &json!({}),
+                false,
+            )
+            .1
         });
         std::thread::sleep(Duration::from_millis(1));
-        let (_, r2) = c.score("b", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false);
+        let (_, r2) = c.score(
+            "b",
+            "p",
+            "mail.send",
+            SideEffect::ExternalSend,
+            "r",
+            &json!({}),
+            false,
+        );
         let r1 = h.join().unwrap();
         assert!(matches!(r1, T2Result::Scored(_)), "{r1:?}");
-        assert!(matches!(r2, T2Result::Timeout { cache_not_ready: false }), "{r2:?}");
+        assert!(
+            matches!(
+                r2,
+                T2Result::Timeout {
+                    cache_not_ready: false
+                }
+            ),
+            "{r2:?}"
+        );
     }
     #[test]
     fn periodic_recheck_failure_fails_closed() {
         let c = fake_probe(0, 0, ok_reply(), false);
         assert!(!c.recheck(Duration::from_secs(2)));
         assert!(c.unavailable().is_some());
-        let (_, r) = c.score("s", "p", "mail.send", SideEffect::ExternalSend, "r", &json!({}), false);
+        let (_, r) = c.score(
+            "s",
+            "p",
+            "mail.send",
+            SideEffect::ExternalSend,
+            "r",
+            &json!({}),
+            false,
+        );
         assert!(matches!(r, T2Result::Unavailable));
         let ok = fake_probe(0, 0, ok_reply(), true);
         assert!(ok.recheck(Duration::from_secs(2)));
@@ -603,12 +707,80 @@ mod dead_t {
         );
         assert!(matches!(r, T2Result::Unavailable));
         assert_eq!(
-            apply(Outcome::Allow, SideEffect::ExternalSend, &r, &c.cfg, crate::rules::Ctx { untrusted_in_session: true }).outcome,
+            apply(
+                Outcome::Allow,
+                SideEffect::ExternalSend,
+                &r,
+                &c.cfg,
+                crate::rules::Ctx {
+                    untrusted_in_session: true
+                }
+            )
+            .outcome,
             Outcome::Escalate
         );
         assert_eq!(
-            apply(Outcome::Allow, SideEffect::Read, &r, &c.cfg, crate::rules::Ctx { untrusted_in_session: true }).outcome,
+            apply(
+                Outcome::Allow,
+                SideEffect::Read,
+                &r,
+                &c.cfg,
+                crate::rules::Ctx {
+                    untrusted_in_session: true
+                }
+            )
+            .outcome,
             Outcome::Allow
         );
+    }
+}
+
+#[cfg(test)]
+mod export_t {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+    #[test]
+    fn export_request_only_in_dev_export_builds() {
+        let p = std::env::temp_dir().join(format!("t2exp{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        let l = UnixListener::bind(&p).unwrap();
+        let seen: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            for line in BufReader::new(s).lines().map_while(Result::ok) {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                s2.lock().unwrap().push(v.clone());
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    json!({"id": v["id"], "op": "score", "scored": false})
+                );
+            }
+        });
+        let c = Client::from_stream(
+            UnixStream::connect(&p).unwrap(),
+            Config::default(),
+            "x".into(),
+            None,
+        )
+        .unwrap();
+        c.score_ex(
+            "s",
+            "p",
+            "t",
+            SideEffect::ExternalSend,
+            "r",
+            &json!({}),
+            false,
+            true,
+        );
+        let got = seen.lock().unwrap()[0].get("export").cloned();
+        if Client::dev_export_compiled() {
+            assert_eq!(got, Some(json!(true)));
+        } else {
+            assert_eq!(got, None, "release/default builds never request an export");
+        }
     }
 }

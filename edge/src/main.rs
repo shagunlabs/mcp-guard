@@ -21,7 +21,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
       --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>
-      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
+      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-dev-export (dev-export builds only; fixture mandates only)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
       [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -64,6 +64,7 @@ struct Opts {
     t2_deadline_ms: u64,
     t2_recheck_secs: u64,
     t2_diag_noprobe: bool,
+    t2_dev_export: bool,
     t2_log: Option<PathBuf>,
     t2_diag: bool,
     t2_allowlist: Option<PathBuf>,
@@ -83,6 +84,7 @@ fn opts(args: &[String]) -> Opts {
         t2_deadline_ms: 10,
         t2_recheck_secs: 60,
         t2_diag_noprobe: false,
+        t2_dev_export: false,
         t2_log: None,
         t2_diag: false,
         t2_allowlist: None,
@@ -114,6 +116,14 @@ fn opts(args: &[String]) -> Opts {
             "--edge-url" => o.edge_url = v(),
             "--tier2-scorer" => o.t2_scorer = Some(v().into()),
             "--tier2-python" => o.t2_python = v(),
+            "--tier2-dev-export" => {
+                if !sentryra_sidecar_risk::client::Client::dev_export_compiled() {
+                    die("--tier2-dev-export: this build has no dev-export feature (release builds never do)");
+                }
+                o.t2_dev_export = true;
+                i += 1;
+                continue;
+            }
             "--tier2-diagnostic-no-probe" => {
                 o.t2_diag_noprobe = true;
                 i += 1;
@@ -222,6 +232,7 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
         scorer_config: sc.clone(),
         scorer_config_path: cfg_path,
         diagnostic_no_probe: o.t2_diag_noprobe,
+        feature_export: o.t2_dev_export,
     }) {
         Ok(c) => {
             eprintln!(
@@ -239,6 +250,7 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
     let c = Arc::new(c);
     c.start_recheck(); // periodic probe re-check through the same FIFO queue
     e.set_tier2(c, o.t2_diag);
+    e.set_tier2_dev_export(o.t2_dev_export);
 }
 
 fn main() {
@@ -271,6 +283,8 @@ fn main() {
             let mut tok = [0u8; 24];
             rand::RngCore::fill_bytes(&mut rng, &mut tok);
             w("approver.token", hex::encode(tok));
+            rand::RngCore::fill_bytes(&mut rng, &mut tok);
+            w("ingest.token", hex::encode(tok)); // bearer for POST /v1/outputs (tool-host side)
             w("root.pub", root_key(&d).public().to_bytes_hex());
             w(
                 "evidence.pub",
@@ -328,7 +342,15 @@ fn main() {
             let o = opts(&a[2..]);
             let e = Arc::new(engine(&d, &o));
             let tok = read(d.join("approver.token")).trim().to_string();
-            serve(e, o.addr, tok);
+            // Output ingest is disabled unless an ingest token exists (keygen writes one).
+            let ing = std::fs::read_to_string(d.join("ingest.token"))
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| s.len() >= 32);
+            if ing.is_none() {
+                eprintln!("[sentryra] no ingest.token: POST /v1/outputs disabled (taint/Tier 2 see no outputs in serve mode)");
+            }
+            serve(e, o.addr, tok, ing);
         }
         "mcp-proxy" => {
             let d = need_dir();
@@ -383,7 +405,9 @@ fn bench(dir: &Path, o: &Opts) {
         .unwrap()
         .to_base64()
         .unwrap();
-    e.observe_output(
+    e.observe_output_in(
+        &tok,
+        None,
         "db.query",
         "ticket 7: customer asks for a refund on order 1234 please",
     );
@@ -438,7 +462,17 @@ fn bench(dir: &Path, o: &Opts) {
     );
 }
 
-fn serve(e: Arc<Engine>, addr: String, approver_token: String) {
+#[derive(serde::Deserialize)]
+struct OutputIngest {
+    mandate: String,
+    decision_id: String,
+    tool: String,
+    output: String,
+    #[serde(default)]
+    context: Option<sentryra_pdp::bindings::Context>,
+}
+
+fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) -> axum::Router {
     use axum::{
         extract::{Path as P, State},
         http::{HeaderMap, StatusCode},
@@ -449,6 +483,7 @@ fn serve(e: Arc<Engine>, addr: String, approver_token: String) {
     struct S {
         e: Arc<Engine>,
         token: Arc<String>,
+        ingest: Arc<Option<String>>,
     }
     // Basic bearer-token auth for the approval view (MVP; production: approver SSO + WebAuthn).
     fn authed(h: &HeaderMap, token: &str) -> bool {
@@ -471,11 +506,9 @@ fn serve(e: Arc<Engine>, addr: String, approver_token: String) {
     let st = S {
         e: e.clone(),
         token: Arc::new(approver_token),
+        ingest: Arc::new(ingest_token),
     };
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async move {
-        let app =
-            Router::new()
+    Router::new()
                 .route(
                     "/v1/decide",
                     post(
@@ -512,11 +545,38 @@ fn serve(e: Arc<Engine>, addr: String, approver_token: String) {
                         },
                     ),
                 )
+                // Tool host reports a tool's output so Tier 1 taint and Tier 2 see it. Auth: ingest
+                // bearer token + verified mandate + a prior allow/shadow decision for the same
+                // mandate/session and tool (single use). Keyed by verified mandate id + session_id.
+                .route(
+                    "/v1/outputs",
+                    post(
+                        |State(s): State<S>, h: HeaderMap, Json(o): Json<OutputIngest>| async move {
+                            let Some(t) = s.ingest.as_ref() else {
+                                return Err(StatusCode::NOT_FOUND);
+                            };
+                            if !authed(&h, t) {
+                                return Err(StatusCode::UNAUTHORIZED);
+                            }
+                            match s.e.ingest_output(&o.mandate, o.context.as_ref(), &o.decision_id, &o.tool, &o.output) {
+                                Ok(()) => Ok(StatusCode::NO_CONTENT),
+                                Err(sentryra_pdp::IngestError::Mandate) => Err(StatusCode::FORBIDDEN),
+                                Err(sentryra_pdp::IngestError::UnknownDecision) => Err(StatusCode::CONFLICT),
+                            }
+                        },
+                    ),
+                )
                 .route(
                     "/v1/evidence",
                     get(|State(s): State<S>| async move { Json(s.e.entries()) }),
                 )
-                .with_state(st);
+                .with_state(st)
+}
+
+fn serve(e: Arc<Engine>, addr: String, approver_token: String, ingest_token: Option<String>) {
+    let app = router(e.clone(), approver_token, ingest_token);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async move {
         let l = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|x| die(x));

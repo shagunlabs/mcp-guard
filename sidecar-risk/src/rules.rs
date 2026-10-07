@@ -133,9 +133,15 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                 (T2_UNAVAILABLE, Via::Unavailable)
             };
             esc |= fl(c, v, required, &mut codes, &mut via); // read / write: none + log
-            // No reply in time => windows_read / windows_total missing => mandatory partial read.
+                                                             // No reply in time => windows_read / windows_total missing => mandatory partial read.
             if send {
-                esc |= fl(T2_PARTIAL_READ, Via::PartialRead, true, &mut codes, &mut via);
+                esc |= fl(
+                    T2_PARTIAL_READ,
+                    Via::PartialRead,
+                    true,
+                    &mut codes,
+                    &mut via,
+                );
             }
         }
         T2Result::Scored(s) if !s.scored => {
@@ -145,9 +151,21 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
         }
         T2Result::Scored(s) => match s.score.filter(|x| x.is_finite() && (0.0..=1.0).contains(x)) {
             None => {
-                esc |= fl(T2_UNAVAILABLE, Via::Unavailable, required, &mut codes, &mut via);
+                esc |= fl(
+                    T2_UNAVAILABLE,
+                    Via::Unavailable,
+                    required,
+                    &mut codes,
+                    &mut via,
+                );
                 if send {
-                    esc |= fl(T2_PARTIAL_READ, Via::PartialRead, true, &mut codes, &mut via);
+                    esc |= fl(
+                        T2_PARTIAL_READ,
+                        Via::PartialRead,
+                        true,
+                        &mut codes,
+                        &mut via,
+                    );
                 }
             }
             Some(x) => {
@@ -166,7 +184,13 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                     via.push(Via::Score);
                 }
                 if (x - cfg.threshold).abs() <= cfg.near_margin + 1e-9 {
-                    esc |= fl(T2_NEAR_THRESHOLD, Via::NearThreshold, true, &mut codes, &mut via);
+                    esc |= fl(
+                        T2_NEAR_THRESHOLD,
+                        Via::NearThreshold,
+                        true,
+                        &mut codes,
+                        &mut via,
+                    );
                 }
                 windows = s.windows();
                 // Mandatory partial-read rule for outbound sends (Edge-side, A1 §2).
@@ -176,7 +200,13 @@ pub fn apply(tier1: Outcome, class: SideEffect, r: &T2Result, cfg: &Config, ctx:
                         _ => true, // missing or non-integer => unread
                     };
                     if partial {
-                        esc |= fl(T2_PARTIAL_READ, Via::PartialRead, true, &mut codes, &mut via);
+                        esc |= fl(
+                            T2_PARTIAL_READ,
+                            Via::PartialRead,
+                            true,
+                            &mut codes,
+                            &mut via,
+                        );
                     }
                 }
             }
@@ -304,7 +334,10 @@ mod t {
             let a = apply(Allow, c, &to, &C, U);
             assert_eq!(a.outcome, Escalate);
             if c == ExternalSend {
-                assert_eq!(a.codes, vec![T2_TIMEOUT.to_string(), T2_PARTIAL_READ.to_string()]);
+                assert_eq!(
+                    a.codes,
+                    vec![T2_TIMEOUT.to_string(), T2_PARTIAL_READ.to_string()]
+                );
                 assert_eq!(a.via, vec![Via::Timeout, Via::PartialRead]);
             } else {
                 assert_eq!(a.codes, vec![T2_TIMEOUT.to_string()]);
@@ -323,9 +356,18 @@ mod t {
     #[test]
     fn malformed_or_nan_is_unavailable() {
         for s in [f64::NAN, 1.5, -0.1] {
-            let a = apply(Allow, ExternalSend, &resp(s, &[], json!(1), json!(1)), &C, U);
+            let a = apply(
+                Allow,
+                ExternalSend,
+                &resp(s, &[], json!(1), json!(1)),
+                &C,
+                U,
+            );
             assert_eq!(a.outcome, Escalate);
-            assert_eq!(a.codes, vec![T2_UNAVAILABLE.to_string(), T2_PARTIAL_READ.to_string()]);
+            assert_eq!(
+                a.codes,
+                vec![T2_UNAVAILABLE.to_string(), T2_PARTIAL_READ.to_string()]
+            );
         }
         assert_eq!(
             apply(Allow, Write, &T2Result::Unavailable, &C, U).outcome,
@@ -411,11 +453,28 @@ mod t {
     #[test]
     fn all_applicable_reasons_recorded() {
         // near threshold + over threshold + partial read on one send
-        let a = apply(Allow, ExternalSend, &resp(0.49, &[], json!(4), json!(7)), &C, U);
-        assert_eq!(a.via, vec![Via::Score, Via::NearThreshold, Via::PartialRead]);
+        let a = apply(
+            Allow,
+            ExternalSend,
+            &resp(0.49, &[], json!(4), json!(7)),
+            &C,
+            U,
+        );
+        assert_eq!(
+            a.via,
+            vec![Via::Score, Via::NearThreshold, Via::PartialRead]
+        );
         assert!(a.codes.contains(&T2_NEAR_THRESHOLD.to_string()));
         assert!(a.codes.contains(&T2_PARTIAL_READ.to_string()));
-        let a = apply(Allow, ExternalSend, &T2Result::Timeout { cache_not_ready: true }, &C, U);
+        let a = apply(
+            Allow,
+            ExternalSend,
+            &T2Result::Timeout {
+                cache_not_ready: true,
+            },
+            &C,
+            U,
+        );
         assert_eq!(a.via, vec![Via::Timeout, Via::PartialRead]);
     }
     #[test]
@@ -436,7 +495,12 @@ mod t {
     #[test]
     fn failure_rules_inert_without_untrusted_in_session() {
         // Tier 2 down / slow must not change Tier 1 when there is nothing untrusted to judge.
-        for r in [T2Result::Unavailable, T2Result::Timeout { cache_not_ready: false }] {
+        for r in [
+            T2Result::Unavailable,
+            T2Result::Timeout {
+                cache_not_ready: false,
+            },
+        ] {
             for c in [Read, Write, ExternalSend, Destructive, Privilege] {
                 let a = apply(Allow, c, &r, &C, NOU);
                 assert_eq!(a.outcome, Allow, "{c:?}");

@@ -41,7 +41,7 @@ if CFG.get("weights_file"):
         sys.exit(f"t2_server: weights sha256 != config {CFG['config_version']}; refusing")
     W = json.load(open(wpath))
 THR = float(CFG["threshold"])
-EXPORT = a.feature_export or os.environ.get("T2_FEATURE_EXPORT") == "1"
+EXPORT = a.feature_export   # only passed by an Edge built with the dev-export feature
 CFG_ID = CFG["config_version"] + ("+diag-noprobe" if a.diagnostic_no_probe else "")
 
 
@@ -177,16 +177,16 @@ def handle(m):
         r = sc.score_call(m["purpose"], m["tool"], m["side_effect"], m.get("resource"), args)
         if m.get("diag"):
             text = " ".join(v for k, v in args.items() if k in scorer.TEXT_FIELDS and isinstance(v, str)) or None
-            DIAG.append((m["id"], m["session"], m["purpose"], text, list(sc.untrusted), r, m["tool"]))
+            DIAG.append((m["id"], m["session"], m["purpose"], text, list(sc.untrusted), r, m["tool"], bool(m.get("export")) and EXPORT))
         out = {"id": m["id"], "op": "score", "session": m["session"], "tool": m["tool"], "scored": r is not None}
         out.update(r or {})
         return out
     if op == "flush":
         outs = []
-        for sid, sk, purpose, text, unt, r, tool in DIAG:
+        for sid, sk, purpose, text, unt, r, tool, exp in DIAG:
             outs.append({"diag": sid, "session": sk, "tool": tool, "score": None if r is None else r["score"],
                          "window_scores": window_scores(SESS[sk], purpose, text, unt, r),
-                         "export": feature_export(SESS[sk], purpose, text, unt, r) if EXPORT else None})
+                         "export": feature_export(SESS[sk], purpose, text, unt, r) if exp else None})
         DIAG.clear()
         return outs + [{"id": m["id"], "op": "flush"}]
     return {"id": m.get("id"), "op": "error", "error": "unknown op"}

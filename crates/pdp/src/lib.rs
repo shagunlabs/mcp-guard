@@ -1,17 +1,24 @@
 //! M2 Tier 1 decision core: Biscuit mandate + signed tool catalogue + Cedar + SQL parse + taint,
 //! in shadow or enforce mode, with every decision written to the signed evidence chain.
 use sentryra_sidecar_risk as t2;
-/// Tier 2 session key: one agent session per Edge process (proxy). See README gaps.
-/// Tier 2 state key for a call: per mandate (token digest) and per agent session
-/// (`context.session_id`, if the caller supplies one). No cross-mandate cache sharing.
-pub fn t2_session_key(mandate: &str, context: Option<&bindings::Context>) -> String {
-    let m = hex::encode(&Sha256::digest(mandate.as_bytes())[..12]);
+/// Per-run state key (Tier 1 taint store and Tier 2 session): the VERIFIED mandate id (from the
+/// Biscuit, never a token hash) plus the host-supplied `context.session_id` (or "-").
+pub fn state_key(mandate_id: &str, context: Option<&bindings::Context>) -> String {
     let s = context
         .and_then(|c| c.get("session_id"))
         .and_then(|v| v.as_str())
         .unwrap_or("-");
-    format!("m:{m}/s:{s}")
+    format!("mdt:{mandate_id}/s:{s}")
 }
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum IngestError {
+    /// Mandate did not verify (signature, expiry, revocation).
+    Mandate,
+    /// No allowed (or shadow) decision with this id for this mandate/session/tool, or already used.
+    UnknownDecision,
+}
+
 pub mod bindings;
 pub mod constraints;
 pub mod receipts;
@@ -112,7 +119,12 @@ pub struct Config {
 
 struct State {
     chain: Chain,
-    taint: taint::Store,
+    /// Taint stores keyed by `state_key` (verified mandate id + session).
+    taint: HashMap<String, taint::Store>,
+    /// Decisions whose tool may have run (allow, or any decision in shadow mode): decision_id ->
+    /// (state key, tool). An output can be ingested once, only against one of these.
+    ran: HashMap<String, (String, String)>,
+    ran_order: std::collections::VecDeque<String>,
     pending: HashMap<String, PendingApproval>,
     file: Option<std::fs::File>,
     counter: u64,
@@ -132,6 +144,7 @@ pub struct Engine {
     state: Mutex<State>,
     /// Optional Tier 2 sidecar (escalate-only). `diag` asks for per-window raw scores (bench).
     tier2: Option<(std::sync::Arc<t2::client::Client>, bool)>,
+    t2_export: bool,
 }
 
 #[derive(Debug)]
@@ -237,19 +250,29 @@ impl Engine {
             approval_sk: c.approval_sk,
             state: Mutex::new(State {
                 chain: Chain::new(c.evidence_key, c.salt_key),
-                taint: taint::Store::default(),
+                taint: HashMap::new(),
+                ran: HashMap::new(),
+                ran_order: Default::default(),
                 pending: HashMap::new(),
                 file,
                 counter: 0,
                 consumed: HashSet::new(),
             }),
             tier2: None,
+            t2_export: false,
         })
     }
 
     /// Attach the Tier 2 sidecar. One sidecar (one scoring session) per Edge process.
     pub fn set_tier2(&mut self, c: std::sync::Arc<t2::client::Client>, diag: bool) {
         self.tier2 = Some((c, diag));
+    }
+
+    /// DEV ONLY: request the Tier 2 feature export for calls whose VERIFIED mandate context marks
+    /// a bench/dev fixture (`sentryra_fixture: "bench" | "dev"`). No-op unless the build has the
+    /// `dev-export` feature (see `Client::dev_export_compiled`).
+    pub fn set_tier2_dev_export(&mut self, on: bool) {
+        self.t2_export = on && t2::client::Client::dev_export_compiled();
     }
 
     pub fn tier2(&self) -> Option<&std::sync::Arc<t2::client::Client>> {
@@ -276,13 +299,37 @@ impl Engine {
             .unwrap_or(true)
     }
 
-    /// Record a relayed tool output for taint tracking (only if the tool's output is untrusted).
-    /// Tier 1 taint ingest is unconditional and independent of Tier 2 (availability or verdicts).
-    pub fn observe_output(&self, tool: &str, text: &str) {
-        self.observe_output_in("", None, tool, text)
+    /// Verified mandate id of a token (signature, revocation, expiry), or None.
+    pub fn verified_mandate_id(&self, mandate: &str) -> Option<String> {
+        self.verified_mandate_id_at(mandate, None)
     }
 
-    /// As `observe_output`, with Tier 2 state keyed by the call's mandate and session.
+    /// As `verified_mandate_id`, at an explicit time (replay / tests only).
+    pub fn verified_mandate_id_at(&self, mandate: &str, now: Option<&str>) -> Option<String> {
+        let now = now.map(String::from).unwrap_or_else(|| now_rfc3339().1);
+        token::verify(mandate, self.root, &self.revoked, "", "", &now)
+            .ok()
+            .map(|v| v.mandate_id)
+    }
+
+    fn ingest_keyed(&self, key: &str, tool: &str, text: &str) {
+        // Tier 1 taint ingest is unconditional and independent of Tier 2 (availability or verdicts).
+        if self.output_untrusted(tool) {
+            self.state
+                .lock()
+                .unwrap()
+                .taint
+                .entry(key.to_string())
+                .or_default()
+                .ingest(text);
+            if let Some((c, _)) = &self.tier2 {
+                c.ingest(key, text); // async: embedded in the sidecar, off the response path
+            }
+        }
+    }
+
+    /// Proxy path: record a relayed tool output (the proxy holds the one mandate it runs under).
+    /// Keyed by the verified mandate id + session; an unverifiable mandate records nothing.
     pub fn observe_output_in(
         &self,
         mandate: &str,
@@ -290,13 +337,49 @@ impl Engine {
         tool: &str,
         text: &str,
     ) {
-        if self.output_untrusted(tool) {
-            self.state.lock().unwrap().taint.ingest(text);
-            if let Some((c, _)) = &self.tier2 {
-                // async: embedded in the sidecar, off the response path
-                c.ingest(&t2_session_key(mandate, context), text);
+        self.observe_output_at(mandate, context, tool, text, None)
+    }
+
+    /// As `observe_output_in`, verifying the mandate at an explicit time (replay / tests only).
+    pub fn observe_output_at(
+        &self,
+        mandate: &str,
+        context: Option<&bindings::Context>,
+        tool: &str,
+        text: &str,
+        now: Option<&str>,
+    ) {
+        if let Some(id) = self.verified_mandate_id_at(mandate, now) {
+            self.ingest_keyed(&state_key(&id, context), tool, text);
+        }
+    }
+
+    /// Serve path (`POST /v1/outputs`): ingest a tool output reported by the caller. Accepted only
+    /// for a verified mandate and a prior decision of THIS Edge that let the tool run (allow, or
+    /// shadow), for the same mandate/session and tool, once.
+    pub fn ingest_output(
+        &self,
+        mandate: &str,
+        context: Option<&bindings::Context>,
+        decision_id: &str,
+        tool: &str,
+        text: &str,
+    ) -> Result<(), IngestError> {
+        let id = self
+            .verified_mandate_id(mandate)
+            .ok_or(IngestError::Mandate)?;
+        let key = state_key(&id, context);
+        {
+            let mut st = self.state.lock().unwrap();
+            match st.ran.get(decision_id) {
+                Some((k, t)) if *k == key && t == tool => {
+                    st.ran.remove(decision_id);
+                }
+                _ => return Err(IngestError::UnknownDecision),
             }
         }
+        self.ingest_keyed(&key, tool, text);
+        Ok(())
     }
 
     fn resource_for(&self, def: Option<&ToolDef>, args: &serde_json::Value) -> String {
@@ -376,8 +459,23 @@ impl Engine {
             t
         };
         // Which string arguments carry values derived from untrusted output seen in this run.
+        let fixture = verified
+            .as_ref()
+            .ok()
+            .and_then(|v| v.context.get("sentryra_fixture"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|f| f == "bench" || f == "dev");
+        let skey = state_key(
+            verified
+                .as_ref()
+                .map(|v| v.mandate_id.as_str())
+                .unwrap_or("!unverified"),
+            req.context.as_ref(),
+        );
         let tainted_any: HashSet<String> = {
             let st = self.state.lock().unwrap();
+            let empty = taint::Store::default();
+            let store = st.taint.get(&skey).unwrap_or(&empty);
             req.args
                 .as_object()
                 .map(|o| {
@@ -404,7 +502,7 @@ impl Engine {
                             } else {
                                 &trusted
                             };
-                            vals.iter().any(|s| st.taint.is_tainted(kind, s, tr))
+                            vals.iter().any(|s| store.is_tainted(kind, s, tr))
                         })
                         .map(|(k, _)| k.clone())
                         .collect()
@@ -548,10 +646,13 @@ impl Engine {
             if let Some(o) = a.as_object_mut() {
                 o.remove("resource");
             }
-            let key = t2_session_key(&req.mandate, req.context.as_ref());
-            let (rid, res) = c.score(&key, &purpose, &req.tool, class, &resource, &a, *diag);
+            let key = &skey;
+            let export = self.t2_export && fixture;
+            let (rid, res) = c.score_ex(
+                key, &purpose, &req.tool, class, &resource, &a, *diag, export,
+            );
             let ctx = t2::rules::Ctx {
-                untrusted_in_session: c.has_untrusted(&key),
+                untrusted_in_session: c.has_untrusted(key),
             };
             let ap = t2::rules::apply(tier1, class, &res, &c.cfg, ctx);
             let via: Vec<String> = ap.via.iter().map(|v| format!("{v:?}")).collect();
@@ -631,6 +732,16 @@ impl Engine {
         let line = serde_json::to_string(e).unwrap();
         if let Some(f) = st.file.as_mut() {
             let _ = writeln!(f, "{line}").and_then(|_| f.flush());
+        }
+        if decision == "allow" || !enforced {
+            st.ran
+                .insert(decision_id.clone(), (skey.clone(), req.tool.clone()));
+            st.ran_order.push_back(decision_id.clone());
+            while st.ran_order.len() > 100_000 {
+                if let Some(old) = st.ran_order.pop_front() {
+                    st.ran.remove(&old);
+                }
+            }
         }
         let approval_link = if decision == "escalate" {
             st.pending.insert(

@@ -8,3 +8,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+
+[features]
+# Tier 2 feature export (window texts, untrusted context, features). DEV/BENCH ONLY: off by default
+# and never in release artifacts. Also needs the runtime flag and a fixture-marked mandate.
+dev-export = []
