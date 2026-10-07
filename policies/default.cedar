@@ -1,4 +1,6 @@
-// Sentryra Tier 1 default policy set. Only these deterministic rules can produce "allow".
+// Sentryra Tier 1 default policy set.
+// Every escalate-permit is conditioned on the mandate not denying: an escalate signal can never
+// turn a mandate deny into a (human-approvable) escalation. Only these deterministic rules can produce "allow".
 // @effect("escalate") on a permit means: if this permit is satisfied, the decision is escalate
 // (strictest wins: deny > escalate > allow). forbid always wins.
 
@@ -21,12 +23,18 @@ when { context.in_catalogue == false && context.mandate_effect != "deny" };
 @id("taint-sink-escalate")
 @effect("escalate")
 permit (principal, action, resource)
-when { context.sink_tainted };
+when { context.sink_tainted && context.mandate_effect != "deny" };
 
-// SQL: no DDL, ever, through the agent path.
+// SQL DDL is forbidden unless a passing mandate scope explicitly lists the DDL verb in
+// sql.statement_types; even then it always needs a human.
 @id("sql-forbid-ddl")
 forbid (principal, action, resource)
-when { context.sql.is_sql && context.sql.has_ddl };
+when { context.sql.is_sql && context.sql.has_ddl && !context.sql.ddl_mandated };
+
+@id("sql-mandated-ddl-escalate")
+@effect("escalate")
+permit (principal, action, resource)
+when { context.sql.is_sql && context.sql.has_ddl && context.sql.ddl_mandated && context.mandate_effect != "deny" };
 
 // SQL that does not parse fails closed.
 @id("sql-forbid-unparseable")
@@ -37,4 +45,4 @@ when { context.sql.is_sql && context.sql.parse_error };
 @id("sql-dml-escalate")
 @effect("escalate")
 permit (principal, action, resource)
-when { context.sql.is_sql && context.sql.has_dml };
+when { context.sql.is_sql && context.sql.has_dml && context.mandate_effect != "deny" };

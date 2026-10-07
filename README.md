@@ -12,7 +12,8 @@ Toolchain: Rust 1.99.0 (`rust-toolchain.toml`), Python 3 for the sample MCP serv
 - **A.** runs a scripted agent through `sentryra-edge mcp-proxy` (stdio, enforce mode) in front of `demo/sample_mcp_server.py` (SQLite SQL tool). The agent reads a ticket containing a prompt injection, then tries `DROP TABLE users`: **denied** (`sql-forbid-ddl`, also flagged as tainted). An uncatalogued `db.admin` tool and a `DELETE` are **escalated**, and the agent gets only a decision ID and a link. The table survives.
 - **B.** verifies the signed evidence chain offline with `sentryra-verify`, prints the DROP TABLE record and shows that tampering with it is detected.
 - **C.** runs `sentryra-edge serve` (HTTP `POST /v1/decide`) in **shadow** mode (decides and logs, doesn't enforce), and opens the Edge-served approval view for an escalation.
-- **D.** runs the Tier 1 latency benchmark.
+- **D.** approval receipt flow: escalate → approver (bearer token) approves → signed receipt → retry allowed once; a receipt for different SQL is rejected, and so is a replay.
+- **E.** runs the Tier 1 latency benchmark.
 
 ## Commands
 ```
@@ -54,11 +55,11 @@ This is a box-local micro-benchmark, not a published number: no WAL fsync, no gR
 | `deploy/terraform`, `.github/workflows/ci.yml`, `deny.toml` | Skeletons; CI never run remotely | — |
 
 ## Not yet built (known gaps)
-- Generic mandate `constraints` (branch, path, domain, amount, `cmd_prefix`, recipient) aren't evaluated yet; only SQL statement class is.
-- Approvals: no approval receipts, no consume-once or approve flow yet; the approval view is unauthenticated (localhost demo only).
+- Constraint `$` context bindings (e.g. `$ticket.requester`) aren't resolved, so they escalate. `max_rows` is recorded but not yet applied to results.
+- Approvals: receipts are signed, single-use and bound to the action hash. The approval view uses one shared bearer token (`keydir/approver.token`), and the Edge itself holds the approval key. Production design: approver SSO + WebAuthn, with the receipt signed by the tenant approval key.
 - Evidence: no WAL fsync, no instance-key certification, no Merkle checkpoints (M3), so tail truncation isn't detected.
 - Proxy: stdio only (no streamable HTTP), no `tools/list` filtering or manifest pinning against the server, no OAuth (M4).
-- Taint: exact word n-gram fingerprints, so paraphrased or encoded copies are missed, and benign copies (for example replying to a sender) escalate.
+- Taint: fingerprints need ≥12-char atoms or ≥16-char 3–4-word shingles with entropy ≥3.0 bits/char, so short copied values (≤11 chars) go undetected, as do paraphrased or encoded copies. Only declared sink args are checked. Copies that pass an explicit mandate allowlist are recorded as a signal only.
 - `doctor` is a heuristic name/path scan, and the egress probe checks 4 public destinations.
 
 ## Repository

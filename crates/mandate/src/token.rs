@@ -78,11 +78,17 @@ pub fn issue(m: &Mandate, root: &KeyPair) -> Result<Biscuit, TokenError> {
         m.expires_at
     );
     for s in &m.scopes {
+        let c = s
+            .constraints
+            .as_ref()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "{}".into());
         code.push_str(&format!(
-            "scope({}, {}, {});\n",
+            "scope({}, {}, {}, {});\n",
             q(&s.tool),
             q(&s.resource),
-            q(eff(s.effect))
+            q(eff(s.effect)),
+            q(&c)
         ));
     }
     Ok(Biscuit::builder().code(code)?.build(root)?)
@@ -131,7 +137,10 @@ pub struct Verified {
     pub mandate_id: String,
     pub principal: String,
     pub agent: String,
+    /// Strictest effect among matching scopes (before constraint evaluation).
     pub effect: Effect,
+    /// Every matching scope as (effect, constraints JSON). Constraints are part of the signed authority block.
+    pub scopes: Vec<(Effect, serde_json::Value)>,
 }
 
 /// Verify signature, revocation, expiry and attenuation checks for one action; return the mandate effect.
@@ -157,21 +166,36 @@ pub fn verify(
             q(tool),
             q(resource)
         ))?
+        .set_limits(biscuit_auth::AuthorizerLimits {
+            // default is 1 ms, which flakes under load; still bounded
+            max_time: std::time::Duration::from_millis(20),
+            ..Default::default()
+        })
         .build(&tok)?;
     a.authorize()?;
     let one = |rule: &str, a: &mut biscuit_auth::Authorizer| -> Result<String, TokenError> {
         let v: Vec<(String,)> = a.query(rule)?;
         Ok(v.into_iter().next().map(|x| x.0).unwrap_or_default())
     };
-    let effects: Vec<(String,)> =
-        a.query(format!("e($e) <- scope({}, {}, $e)", q(tool), q(resource)).as_str())?;
-    let effect = effects
+    let rows: Vec<(String, String)> =
+        a.query(format!("e($e, $c) <- scope({}, {}, $e, $c)", q(tool), q(resource)).as_str())?;
+    let to_eff = |e: &str| match e {
+        "allow" => Effect::Allow,
+        "escalate" => Effect::Escalate,
+        _ => Effect::Deny,
+    };
+    let scopes: Vec<(Effect, serde_json::Value)> = rows
         .iter()
-        .map(|(e,)| match e.as_str() {
-            "allow" => Effect::Allow,
-            "escalate" => Effect::Escalate,
-            _ => Effect::Deny,
+        .map(|(e, c)| {
+            (
+                to_eff(e),
+                serde_json::from_str(c).unwrap_or(serde_json::Value::Null),
+            )
         })
+        .collect();
+    let effect = scopes
+        .iter()
+        .map(|(e, _)| *e)
         .max_by_key(|e| match e {
             Effect::Allow => 0,
             Effect::Escalate => 1,
@@ -183,6 +207,7 @@ pub fn verify(
         principal: one("p($p) <- principal($p)", &mut a)?,
         agent: one("a($a) <- agent($a)", &mut a)?,
         effect,
+        scopes,
     })
 }
 
@@ -218,6 +243,8 @@ mod tests {
         let r = v(&t, &root, "k8s.apply", "cluster:staging/ns:billing", NOW).unwrap();
         assert_eq!(r.effect, Effect::Allow);
         assert_eq!(r.principal, "priya@acme.com");
+        let pg = v(&t, &root, "postgres.query", "db:billing", NOW).unwrap();
+        assert_eq!(pg.scopes[0].1["max_rows"], 1000);
         assert_eq!(
             v(&t, &root, "k8s.apply", "cluster:prod/ns:billing", NOW)
                 .unwrap()
@@ -291,7 +318,7 @@ mod tests {
         let sneaky = t
             .append(
                 BlockBuilder::new()
-                    .code(r#"scope("k8s.delete", "cluster:prod/ns:billing", "allow");"#)
+                    .code(r#"scope("k8s.delete", "cluster:prod/ns:billing", "allow", "{}");"#)
                     .unwrap(),
             )
             .unwrap();

@@ -135,6 +135,8 @@ fn engine(dir: &Path, o: &Opts) -> Engine {
         evidence_path: o.evidence.clone(),
         edge_url: o.edge_url.clone(),
         revoked: o.revoked.iter().cloned().collect(),
+        approval_vk: ed_key(dir, "approval.key").verifying_key(),
+        approval_sk: Some(ed_key(dir, "approval.key")),
     })
     .unwrap_or_else(|e| die(e))
 }
@@ -162,6 +164,13 @@ fn main() {
             let mut salt = [0u8; 32];
             rand::RngCore::fill_bytes(&mut rng, &mut salt);
             w("salt.key", hex::encode(salt));
+            w(
+                "approval.key",
+                hex::encode(SigningKey::generate(&mut rng).to_bytes()),
+            );
+            let mut tok = [0u8; 24];
+            rand::RngCore::fill_bytes(&mut rng, &mut tok);
+            w("approver.token", hex::encode(tok));
             w("root.pub", root_key(&d).public().to_bytes_hex());
             w(
                 "evidence.pub",
@@ -218,7 +227,8 @@ fn main() {
             let d = need_dir();
             let o = opts(&a[2..]);
             let e = Arc::new(engine(&d, &o));
-            serve(e, o.addr);
+            let tok = read(d.join("approver.token")).trim().to_string();
+            serve(e, o.addr, tok);
         }
         "mcp-proxy" => {
             let d = need_dir();
@@ -276,6 +286,7 @@ fn bench(dir: &Path, o: &Opts) {
             tool: "db.query".into(),
             args: c.clone(),
             now: None,
+            receipt: None,
         });
     }
     let mut lat = Vec::with_capacity(o.n);
@@ -285,6 +296,7 @@ fn bench(dir: &Path, o: &Opts) {
             tool: "db.query".into(),
             args: cases[i % cases.len()].clone(),
             now: None,
+            receipt: None,
         };
         let t = std::time::Instant::now();
         std::hint::black_box(e.decide(&r));
@@ -312,41 +324,85 @@ fn bench(dir: &Path, o: &Opts) {
     );
 }
 
-fn serve(e: Arc<Engine>, addr: String) {
+fn serve(e: Arc<Engine>, addr: String, approver_token: String) {
     use axum::{
         extract::{Path as P, State},
-        http::StatusCode,
+        http::{HeaderMap, StatusCode},
         routing::{get, post},
         Json, Router,
     };
+    #[derive(Clone)]
+    struct S {
+        e: Arc<Engine>,
+        token: Arc<String>,
+    }
+    // Basic bearer-token auth for the approval view (MVP; production: approver SSO + WebAuthn).
+    fn authed(h: &HeaderMap, token: &str) -> bool {
+        let got = h
+            .get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .unwrap_or("");
+        got.len() == token.len()
+            && got
+                .bytes()
+                .zip(token.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    }
+    #[derive(serde::Deserialize)]
+    struct Approve {
+        approver: String,
+    }
+    let st = S {
+        e: e.clone(),
+        token: Arc::new(approver_token),
+    };
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async move {
-        let app = Router::new()
-            .route(
-                "/v1/decide",
-                post(
-                    |State(e): State<Arc<Engine>>, Json(r): Json<DecideRequest>| async move {
-                        Json(e.decide(&r))
-                    },
-                ),
-            )
-            // Approval view: served by the customer-side Edge, so raw args never transit the control plane.
-            .route(
-                "/v1/approvals/{id}",
-                get(
-                    |State(e): State<Arc<Engine>>, P(id): P<String>| async move {
-                        match e.pending(&id) {
-                            Some(p) => Ok(Json(p)),
-                            None => Err(StatusCode::NOT_FOUND),
-                        }
-                    },
-                ),
-            )
-            .route(
-                "/v1/evidence",
-                get(|State(e): State<Arc<Engine>>| async move { Json(e.entries()) }),
-            )
-            .with_state(e.clone());
+        let app =
+            Router::new()
+                .route(
+                    "/v1/decide",
+                    post(
+                        |State(s): State<S>, Json(r): Json<DecideRequest>| async move {
+                            Json(s.e.decide(&r))
+                        },
+                    ),
+                )
+                // Approval view: served by the customer-side Edge, so raw args never transit the control plane.
+                .route(
+                    "/v1/approvals/{id}",
+                    get(
+                        |State(s): State<S>, h: HeaderMap, P(id): P<String>| async move {
+                            if !authed(&h, &s.token) {
+                                return Err(StatusCode::UNAUTHORIZED);
+                            }
+                            s.e.pending(&id).map(Json).ok_or(StatusCode::NOT_FOUND)
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/approvals/{id}/approve",
+                    post(
+                        |State(s): State<S>,
+                         h: HeaderMap,
+                         P(id): P<String>,
+                         Json(a): Json<Approve>| async move {
+                            if !authed(&h, &s.token) {
+                                return Err(StatusCode::UNAUTHORIZED);
+                            }
+                            s.e.approve(&id, &a.approver)
+                                .map(Json)
+                                .map_err(|_| StatusCode::NOT_FOUND)
+                        },
+                    ),
+                )
+                .route(
+                    "/v1/evidence",
+                    get(|State(s): State<S>| async move { Json(s.e.entries()) }),
+                )
+                .with_state(st);
         let l = tokio::net::TcpListener::bind(&addr)
             .await
             .unwrap_or_else(|x| die(x));

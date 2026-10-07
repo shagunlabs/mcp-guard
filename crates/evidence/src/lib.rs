@@ -34,6 +34,9 @@ pub struct Entry {
     pub enforced: bool,
     pub policy_ids: Vec<String>,
     pub reasons: Vec<String>,
+    /// SHA-256 of the approval receipt that resolved this escalation, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
     pub prev_hash: String,
     #[serde(default)]
     pub entry_hash: String,
@@ -56,6 +59,7 @@ pub struct NewEntry<'a> {
     pub enforced: bool,
     pub policy_ids: Vec<String>,
     pub reasons: Vec<String>,
+    pub approval: Option<String>,
 }
 
 pub fn salted_hash(key: &[u8], value: &serde_json::Value) -> String {
@@ -121,6 +125,7 @@ impl Chain {
             enforced: n.enforced,
             policy_ids: n.policy_ids,
             reasons: n.reasons,
+            approval: n.approval,
             prev_hash: prev,
             entry_hash: String::new(),
             sig: String::new(),
@@ -191,6 +196,7 @@ mod tests {
                 enforced: true,
                 policy_ids: vec![],
                 reasons: vec![],
+                approval: None,
             });
         }
         c

@@ -73,6 +73,87 @@ pub fn classify(sql: &str) -> Class {
     c
 }
 
+impl Class {
+    /// Statement classes present: SELECT, INSERT, UPDATE, DELETE, MERGE, DDL.
+    pub fn classes(&self) -> Vec<String> {
+        let mut out = vec![];
+        if self.has_ddl {
+            out.push("DDL".to_string());
+        }
+        for k in ["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"] {
+            if self
+                .kinds
+                .iter()
+                .any(|x| x == k || x == &format!("nested {k}"))
+            {
+                out.push(k.to_string());
+            }
+        }
+        out
+    }
+}
+
+impl Class {
+    /// DDL verbs present (DROP, TRUNCATE, ALTER, CREATE, GRANT, ...).
+    pub fn ddl_verbs(&self) -> Vec<String> {
+        self.kinds
+            .iter()
+            .filter(|k| {
+                !["SELECT", "INSERT", "UPDATE", "DELETE", "MERGE"].contains(&k.as_str())
+                    && !k.starts_with("nested INSERT")
+                    && !k.starts_with("nested UPDATE")
+                    && !k.starts_with("nested DELETE")
+                    && !k.starts_with("nested MERGE")
+            })
+            .map(|k| {
+                k.trim_start_matches("nested ")
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_uppercase()
+            })
+            .collect()
+    }
+}
+
+/// Table names referenced after FROM / JOIN / INTO / UPDATE / TABLE (lower-case, unqualified).
+pub fn tables(sql: &str) -> Vec<String> {
+    use sqlparser::keywords::Keyword as K;
+    use sqlparser::tokenizer::{Token, Tokenizer};
+    let Ok(toks) = Tokenizer::new(&GenericDialect {}, sql).tokenize() else {
+        return vec!["<unparseable>".into()];
+    };
+    let toks: Vec<Token> = toks
+        .into_iter()
+        .filter(|t| !matches!(t, Token::Whitespace(_)))
+        .collect();
+    let mut out = vec![];
+    for (i, t) in toks.iter().enumerate() {
+        if let Token::Word(w) = t {
+            if matches!(
+                w.keyword,
+                K::FROM | K::JOIN | K::INTO | K::UPDATE | K::TABLE
+            ) {
+                if let Some(Token::Word(n)) = toks.get(i + 1) {
+                    if !matches!(
+                        n.keyword,
+                        K::SELECT | K::LATERAL | K::IF | K::ONLY | K::UNNEST | K::VALUES
+                    ) {
+                        let mut name = n.value.to_lowercase();
+                        if let (Some(Token::Period), Some(Token::Word(m))) =
+                            (toks.get(i + 2), toks.get(i + 3))
+                        {
+                            name = m.value.to_lowercase();
+                        }
+                        out.push(name);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod t {
     use super::*;

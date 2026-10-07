@@ -72,6 +72,11 @@ pub fn run(e: Arc<Engine>, mandate: String, cmd: &[String]) -> i32 {
                 tool: tool.clone(),
                 args,
                 now: None,
+                // An approved retry carries its signed receipt in `_meta`.
+                receipt: p
+                    .get("_meta")
+                    .and_then(|m| m.get("com.sentryra/receipt"))
+                    .and_then(|r| serde_json::from_value(r.clone()).ok()),
             });
             eprintln!(
                 "[sentryra] {} {} -> {}{} (policies: {}) {}",

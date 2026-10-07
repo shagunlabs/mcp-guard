@@ -49,8 +49,27 @@ D() { curl -s -X POST http://127.0.0.1:18787/v1/decide -H 'content-type: applica
 echo "-- DROP TABLE (shadow: decided + logged, not enforced)"; D "DROP TABLE users" | python3 -m json.tool
 echo "-- DELETE (escalate: only decision id + deep link leave the Edge)"; ESC=$(D "DELETE FROM users WHERE id = 2"); echo "$ESC" | python3 -m json.tool
 LINK=$(echo "$ESC" | python3 -c 'import json,sys;print(json.load(sys.stdin)["approval_link"])')
-echo "-- approver opens $LINK (served by the customer-side Edge; raw args live only here)"; curl -s "$LINK" | python3 -m json.tool
+echo "-- approver opens $LINK (served by the customer-side Edge; raw args live only here)"
+echo "   without token: HTTP $(curl -s -o /dev/null -w '%{http_code}' "$LINK")"
+curl -s -H "Authorization: Bearer $(cat "$R/keys/approver.token")" "$LINK" | python3 -m json.tool
 kill $SP; trap - EXIT
 
-echo; echo "== D. Tier 1 latency (box-local benchmark)"
+echo; echo "== D. approval receipt flow (ENFORCE, HTTP): signed, single-use, bound to the action hash"
+$EDGE serve "$R/keys" --mode enforce --catalogue "$R/catalogue.json" --addr 127.0.0.1:18788 --edge-url http://127.0.0.1:18788 2>"$R/serve2.log" &
+SP=$!; trap 'kill $SP 2>/dev/null || true' EXIT
+for i in $(seq 50); do curl -sf -o /dev/null http://127.0.0.1:18788/v1/evidence && break; sleep 0.1; done
+TOKEN=$(cat "$R/keys/approver.token")
+REQ='{"mandate":"'$SENTRYRA_MANDATE'","tool":"db.query","args":{"db":"demo","sql":"DELETE FROM users WHERE id = 2"}}'
+DID=$(curl -s -X POST http://127.0.0.1:18788/v1/decide -H 'content-type: application/json' -d "$REQ" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["decision_id"]);print("  1st call:",d["decision"],file=sys.stderr)')
+RCPT=$(curl -s -X POST "http://127.0.0.1:18788/v1/approvals/$DID/approve" -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' -d '{"approver":"sre-oncall@acme.example"}')
+echo "  receipt: $(echo "$RCPT" | python3 -c 'import json,sys;r=json.load(sys.stdin);print(r["apr_id"],"action_hash",r["action_hash"][:16]+"…","sig",r["sig"][:16]+"…")')"
+WITH=$(python3 -c 'import json,sys;q=json.loads(sys.argv[1]);q["receipt"]=json.loads(sys.argv[2]);print(json.dumps(q))' "$REQ" "$RCPT")
+OTHER=$(python3 -c 'import json,sys;q=json.loads(sys.argv[1]);q["args"]["sql"]="DELETE FROM users";print(json.dumps(q))' "$WITH")
+dec() { curl -s -X POST http://127.0.0.1:18788/v1/decide -H 'content-type: application/json' -d "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["decision"],"|",d["reasons"][-1] if d["reasons"] else "")'; }
+echo "  same receipt, different SQL : $(dec "$OTHER")"
+echo "  retry with receipt          : $(dec "$WITH")"
+echo "  replay same receipt         : $(dec "$WITH")"
+kill $SP; trap - EXIT
+
+echo; echo "== E. Tier 1 latency (box-local benchmark)"
 $EDGE bench "$R/keys" --catalogue "$R/catalogue.json" --n 20000
