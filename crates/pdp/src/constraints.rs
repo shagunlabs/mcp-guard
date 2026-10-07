@@ -168,47 +168,35 @@ fn addresses_in(v: &Value, out: &mut Vec<String>) {
     }
 }
 
-/// `mail.recipients` (exact-address allowlist). Fail closed on every shape a recipient can hide in:
-/// - unresolved `$binding`: escalate;
+/// Fail-closed recipient checks shared by `mail.recipients` and `mail.recipient_domains` (`key`).
+/// `accept(addr)` says whether a normalised address satisfies the constraint.
 /// - catalogue declares the tool `external_send` but declares no `email` argument: escalate;
 /// - no recipient (`email`-kind) argument with a value in the call: escalate;
-/// - each `email`-kind argument: every value must be in the list, else deny (`from` included);
 /// - any OTHER argument (not `email`, not free `text` such as `body`, which is content rather
 ///   than routing) holding an address-shaped value anywhere (e.g. `forward_to`, `target`,
-///   `subject`, nested objects, `mailto:` URLs): an address not in the list denies; an address in
-///   the list still escalates, because the field is not a recognised recipient field. Such a call
-///   is never allowed through.
-fn mail_recipients(o: &mut Outcome, val: &Value, args: &Value, def: Option<&ToolDef>) {
-    let allowed_raw = list(val);
-    let unresolved = allowed_raw
-        .iter()
-        .any(|a| a.as_str().is_some_and(|s| s.starts_with('$')));
-    if unresolved {
-        o.escalate(
-            "constraint: `mail.recipients` uses a context binding the Edge cannot resolve yet"
-                .into(),
-        );
-        return;
-    }
+///   `subject`, nested objects, `mailto:` URLs): an address the constraint rejects denies; an
+///   accepted address still escalates, because the field is not a recognised recipient field.
+///   Such a call is never allowed through.
+///
+/// The `email`-kind arguments themselves are checked by the caller.
+fn recipients_fail_closed(
+    o: &mut Outcome,
+    key: &str,
+    args: &Value,
+    def: Option<&ToolDef>,
+    accept: &dyn Fn(&str) -> bool,
+) {
     if let Some(d) = def {
         if d.side_effect_class.as_deref() == Some("external_send")
             && !d.args.values().any(|k| *k == ArgKind::Email)
         {
             o.escalate(format!(
-                "constraint: mail.recipients set but catalogue declares no recipient (email) argument for outbound send `{}`",
+                "constraint: {key} set but catalogue declares no recipient (email) argument for outbound send `{}`",
                 d.name
             ));
         }
     }
-    let allowed: Vec<String> = allowed_raw
-        .iter()
-        .map(|a| match a {
-            Value::String(s) => s.trim().to_lowercase(),
-            x => x.to_string(),
-        })
-        .collect();
-    let targets = args_of_kind(args, def, &[ArgKind::Email]);
-    let n_values: usize = targets
+    let n_values: usize = args_of_kind(args, def, &[ArgKind::Email])
         .iter()
         .map(|(_, v)| match v {
             Value::Null => 0,
@@ -216,18 +204,9 @@ fn mail_recipients(o: &mut Outcome, val: &Value, args: &Value, def: Option<&Tool
         })
         .sum();
     if n_values == 0 {
-        o.escalate("constraint: mail.recipients set but no recipient field found".into());
-    }
-    for (an, v) in &targets {
-        let ok = list(v).iter().all(|x| {
-            x.as_str()
-                .is_some_and(|s| allowed.contains(&s.trim().to_lowercase()))
-        });
-        if ok {
-            o.vouched.insert((*an).clone());
-        } else {
-            o.deny(format!("constraint: `{an}` value not in mail.recipients"));
-        }
+        o.escalate(format!(
+            "constraint: {key} set but no recipient field found"
+        ));
     }
     let empty = serde_json::Map::new();
     for (an, v) in args.as_object().unwrap_or(&empty) {
@@ -242,14 +221,50 @@ fn mail_recipients(o: &mut Outcome, val: &Value, args: &Value, def: Option<&Tool
         if found.is_empty() {
             continue;
         }
-        if found.iter().any(|a| !allowed.contains(a)) {
-            o.deny(format!(
-                "constraint: `{an}` holds an address not in mail.recipients"
-            ));
+        if found.iter().any(|a| !accept(a)) {
+            o.deny(format!("constraint: `{an}` holds an address not in {key}"));
         } else {
             o.escalate(format!(
                 "constraint: `{an}` holds an address but is not a recognised recipient field"
             ));
+        }
+    }
+}
+
+/// `mail.recipients` (exact-address allowlist). An unresolved `$binding` escalates; every value of
+/// every `email`-kind argument (`from` included) must be in the list, else deny; plus the shared
+/// fail-closed checks in `recipients_fail_closed`.
+fn mail_recipients(o: &mut Outcome, val: &Value, args: &Value, def: Option<&ToolDef>) {
+    let allowed_raw = list(val);
+    let unresolved = allowed_raw
+        .iter()
+        .any(|a| a.as_str().is_some_and(|s| s.starts_with('$')));
+    if unresolved {
+        o.escalate(
+            "constraint: `mail.recipients` uses a context binding the Edge cannot resolve yet"
+                .into(),
+        );
+        return;
+    }
+    let allowed: Vec<String> = allowed_raw
+        .iter()
+        .map(|a| match a {
+            Value::String(s) => s.trim().to_lowercase(),
+            x => x.to_string(),
+        })
+        .collect();
+    recipients_fail_closed(o, "mail.recipients", args, def, &|a| {
+        allowed.iter().any(|x| x == a)
+    });
+    for (an, v) in args_of_kind(args, def, &[ArgKind::Email]) {
+        let ok = list(v).iter().all(|x| {
+            x.as_str()
+                .is_some_and(|s| allowed.contains(&s.trim().to_lowercase()))
+        });
+        if ok {
+            o.vouched.insert(an.clone());
+        } else {
+            o.deny(format!("constraint: `{an}` value not in mail.recipients"));
         }
     }
 }
@@ -425,6 +440,9 @@ pub fn eval(
             }
             "mail.recipient_domains" => {
                 let allowed = strings(val);
+                recipients_fail_closed(&mut o, k, args, def, &|a| {
+                    host_of(ArgKind::Email, a).is_some_and(|h| domain_ok(&h, &allowed))
+                });
                 for (an, v) in args_of_kind(args, def, &[ArgKind::Email]) {
                     let mut ok = true;
                     for s in strings(v) {
@@ -653,6 +671,48 @@ mod tests {
         assert!(address_tokens("Bob <B@X.example>, mailto:c@y.example").len() == 2);
         assert!(address_tokens("https://user@host/x").is_empty());
         assert!(address_tokens("no address here @ all").is_empty());
+    }
+    #[test]
+    fn domains_fail_closed() {
+        let c = json!({"mail.recipient_domains": ["acme.example"]});
+        assert_eq!(v(c.clone(), json!({"to": "a@acme.example"})), Verdict::Pass);
+        assert_eq!(v(c.clone(), json!({"body": "hi"})), Verdict::Escalate);
+        assert_eq!(v(c.clone(), json!({})), Verdict::Escalate);
+        assert_eq!(v(c.clone(), json!({"to": []})), Verdict::Escalate);
+        assert_eq!(v(c.clone(), json!({"to": null})), Verdict::Escalate);
+        assert_eq!(
+            v(c.clone(), json!({"address": "a@acme.example"})),
+            Verdict::Escalate
+        );
+        assert_eq!(
+            v(c.clone(), json!({"target": "x@evil.example"})),
+            Verdict::Deny
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "a@acme.example", "forward_to": "x@evil.example"})
+            ),
+            Verdict::Deny
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "a@acme.example", "forward_to": "b@eu.acme.example"})
+            ),
+            Verdict::Escalate
+        );
+        assert_eq!(
+            v(
+                c.clone(),
+                json!({"to": "a@acme.example", "body": "cc x@evil.example"})
+            ),
+            Verdict::Pass
+        );
+        assert_eq!(
+            v(c, json!({"to": "a@acme.example", "from": "s@evil.example"})),
+            Verdict::Deny
+        );
     }
     #[test]
     fn amounts() {

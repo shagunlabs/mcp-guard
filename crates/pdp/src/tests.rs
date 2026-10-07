@@ -949,6 +949,17 @@ fn window_filter_skipped_windows_escalate_outbound_send_as_partial_read() {
 /// and `mail.send` (external_send) with catalogue-declared args `mail_args`. Tier 2 is not attached.
 /// Returns (engine, token with signed `ticket.requester`, token with no context).
 fn bound_send_engine(mail_args: serde_json::Value) -> (Engine, String, String) {
+    support_send_engine(
+        mail_args,
+        serde_json::json!({"mail.recipients": ["$ticket.requester"]}),
+    )
+}
+
+/// As `bound_send_engine`, with arbitrary signed `mail.send` scope constraints.
+fn support_send_engine(
+    mail_args: serde_json::Value,
+    constraints: serde_json::Value,
+) -> (Engine, String, String) {
     let root = KeyPair::new();
     let cat = SigningKey::generate(&mut rand::rngs::OsRng);
     let man = serde_json::json!({"spec":"sentryra.connector/v0","connector":"support","version":"0.0.1","tools":[
@@ -980,7 +991,7 @@ fn bound_send_engine(mail_args: serde_json::Value) -> (Engine, String, String) {
             "scopes": [
                 {"tool": "ticket.read", "resource": "tickets", "effect": "allow"},
                 {"tool": "mail.send", "resource": "mail", "effect": "allow",
-                 "constraints": {"mail.recipients": ["$ticket.requester"]}}
+                 "constraints": constraints}
             ],
             "default_effect": "deny", "not_before": "2026-10-07T12:00:00Z", "expires_at": "2026-10-07T20:00:00Z"
         });
@@ -1268,4 +1279,130 @@ fn mail_recipients_fail_closed_without_recognised_recipient_field() {
         serde_json::json!({"to": REQ, "body": body}),
     ));
     assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+}
+
+/// `mail.recipient_domains` gets the same fail-closed treatment as `mail.recipients` (Tier 1 only):
+/// no recipient field => escalate; catalogue `external_send` without declared email args =>
+/// escalate; unknown non-text args are scanned: an address outside the allowed domains denies, an
+/// in-domain address in an unrecognised field escalates. Free-text body/subject are ignored.
+#[test]
+fn mail_recipient_domains_fail_closed() {
+    let cons = serde_json::json!({"mail.recipient_domains": ["cust.example"]});
+    let (e, t, _) = support_send_engine(mail_args_declared(), cons.clone());
+    let send = |args: serde_json::Value| {
+        let r = e.decide(&req(&t, "mail.send", args));
+        assert!(
+            !r.reasons.iter().any(|x| x.starts_with("tier2:")),
+            "Tier 2 must not act: {:?}",
+            r.reasons
+        );
+        r
+    };
+    let has = |r: &DecideResponse, s: &str| r.reasons.iter().any(|x| x.contains(s));
+    const NO_FIELD: &str = "constraint: mail.recipient_domains set but no recipient field found";
+    let body = "Your refund has been issued.";
+
+    // in-domain recipients (incl. subdomain, case/whitespace) are allowed; others denied as before.
+    for to in [
+        serde_json::json!("a@cust.example"),
+        serde_json::json!(" B@EU.Cust.Example "),
+        serde_json::json!(["a@cust.example", "b@cust.example"]),
+    ] {
+        let r = send(serde_json::json!({"to": to, "cc": "c@cust.example", "body": body}));
+        assert_eq!(r.decision, "allow", "{to}: {:?}", r.reasons);
+    }
+    for args in [
+        serde_json::json!({"to": "x@evil.example", "body": body}),
+        serde_json::json!({"to": "a@cust.example", "bcc": "x@evil.example", "body": body}),
+        serde_json::json!({"to": "a@cust.example.evil.example", "body": body}),
+        serde_json::json!({"to": "a@cust.example", "from": "support@acme.example", "body": body}),
+    ] {
+        assert_eq!(send(args.clone()).decision, "deny", "{args}");
+    }
+
+    // 1. no recognised recipient field: escalate.
+    for args in [
+        serde_json::json!({"body": body}),
+        serde_json::json!({}),
+        serde_json::json!({"to": [], "body": body}),
+        serde_json::json!({"address": "a@cust.example", "body": body}),
+        serde_json::json!({"target": "crm:contact/42", "body": body}),
+    ] {
+        let r = send(args.clone());
+        assert_eq!(r.decision, "escalate", "{args}: {:?}", r.reasons);
+        assert!(has(&r, NO_FIELD), "{args}: {:?}", r.reasons);
+    }
+    //    ... an unknown field alone carrying an out-of-domain address is denied.
+    for f in ["address", "target"] {
+        let r = send(serde_json::json!({f: "x@evil.example", "body": body}));
+        assert_eq!(r.decision, "deny", "{f}: {:?}", r.reasons);
+        assert!(has(&r, "holds an address not in mail.recipient_domains"));
+    }
+
+    // 2. unknown non-text fields are scanned: an out-of-domain address anywhere denies.
+    for (extra, v) in [
+        ("forward_to", serde_json::json!("x@evil.example")),
+        ("forward_to", serde_json::json!("Exfil <X@EVIL.EXAMPLE>")),
+        (
+            "forward_to",
+            serde_json::json!("a@cust.example.evil.example"),
+        ),
+        ("forward_to", serde_json::json!("ops@cust.exampl\u{0435}")),
+        ("callback", serde_json::json!("mailto:x@evil.example")),
+        (
+            "routing",
+            serde_json::json!({"next": [{"hop": "x@evil.example"}]}),
+        ),
+        (
+            "notify",
+            serde_json::json!("a@cust.example; x@evil.example"),
+        ),
+        ("title", serde_json::json!("fwd to x@evil.example please")),
+    ] {
+        let r = send(serde_json::json!({"to": "a@cust.example", extra: v, "body": body}));
+        assert_eq!(r.decision, "deny", "{extra}={v}: {:?}", r.reasons);
+        assert!(
+            has(
+                &r,
+                &format!("`{extra}` holds an address not in mail.recipient_domains")
+            ),
+            "{:?}",
+            r.reasons
+        );
+    }
+    //    an in-domain address in an unrecognised field: held, never allowed.
+    let r = send(
+        serde_json::json!({"to": "a@cust.example", "forward_to": "b@cust.example", "body": body}),
+    );
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(has(
+        &r,
+        "`forward_to` holds an address but is not a recognised recipient field"
+    ));
+    //    free-text body / subject (declared `text`) mentioning an address is content, not routing.
+    let r = send(
+        serde_json::json!({"to": "a@cust.example", "subject": "Re: x@evil.example",
+        "body": "Contact x@evil.example for returns."}),
+    );
+    assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+
+    // 3. catalogue declares mail.send external_send with no email-kind args: escalate (and an
+    //    out-of-domain recipient still denies).
+    let (e2, t2, _) = support_send_engine(serde_json::json!({"body": "text"}), cons);
+    let r = e2.decide(&req(
+        &t2,
+        "mail.send",
+        serde_json::json!({"to": "a@cust.example", "body": body}),
+    ));
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(has(
+        &r,
+        "constraint: mail.recipient_domains set but catalogue declares no recipient (email) argument for outbound send `mail.send`"
+    ), "{:?}", r.reasons);
+    let r = e2.decide(&req(
+        &t2,
+        "mail.send",
+        serde_json::json!({"to": "x@evil.example", "body": body}),
+    ));
+    assert_eq!(r.decision, "deny", "{:?}", r.reasons);
 }
