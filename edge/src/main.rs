@@ -9,6 +9,8 @@ use sentryra_pdp::{Config, DecideRequest, Engine, Mode};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+const DEFAULT_POLICIES: &str = include_str!("../../policies/default.cedar");
+
 const USAGE: &str = "usage: sentryra-edge <command>
   keygen <keydir>                               create local demo keys (root, catalogue, evidence, salt)
   sign-catalogue <keydir> <manifest.json>       write <manifest.json>.sig
@@ -20,7 +22,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
-      --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>
+      --policies <file.cedar> (default: compiled-in) --evidence <file.jsonl> (default: <keydir>/evidence.jsonl; --no-evidence to disable) --revoked <id,...> --edge-url <url>
       --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-dev-export (dev-export builds only; fixture mandates only)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
       [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
 
@@ -51,7 +53,8 @@ fn ed_key(dir: &Path, name: &str) -> SigningKey {
 struct Opts {
     mode: Mode,
     catalogue: Vec<PathBuf>,
-    policies: PathBuf,
+    policies: Option<PathBuf>,
+    no_evidence: bool,
     evidence: Option<PathBuf>,
     revoked: Vec<String>,
     edge_url: String,
@@ -75,7 +78,8 @@ fn opts(args: &[String]) -> Opts {
     let mut o = Opts {
         mode: Mode::Enforce,
         catalogue: vec![],
-        policies: "policies/default.cedar".into(),
+        policies: None,
+        no_evidence: false,
         evidence: None,
         revoked: vec![],
         edge_url: "http://127.0.0.1:8787".into(),
@@ -110,7 +114,12 @@ fn opts(args: &[String]) -> Opts {
                 }
             }
             "--catalogue" => o.catalogue.push(v().into()),
-            "--policies" => o.policies = v().into(),
+            "--policies" => o.policies = Some(v().into()),
+            "--no-evidence" => {
+                o.no_evidence = true;
+                i += 1;
+                continue;
+            }
             "--evidence" => o.evidence = Some(v().into()),
             "--revoked" => o.revoked = v().split(',').map(String::from).collect(),
             "--edge-url" => o.edge_url = v(),
@@ -179,11 +188,23 @@ fn engine(dir: &Path, o: &Opts) -> Engine {
         root: root_key(dir).public(),
         catalogue_key: ed_key(dir, "catalogue.key").verifying_key(),
         manifests,
-        policies: read(&o.policies),
+        policies: match &o.policies {
+            Some(p) => read(p),
+            None => DEFAULT_POLICIES.to_string(), // compiled-in default; override with --policies
+        },
         evidence_key: ed_key(dir, "evidence.key"),
         salt_key: hex::decode(read(dir.join("salt.key")).trim()).unwrap_or_else(|e| die(e)),
         mode: o.mode,
-        evidence_path: o.evidence.clone(),
+        // Evidence log is ON by default: <keydir>/evidence.jsonl, or $SENTRYRA_EVIDENCE, or --evidence.
+        evidence_path: if o.no_evidence {
+            None
+        } else {
+            Some(o.evidence.clone().unwrap_or_else(|| {
+                std::env::var_os("SENTRYRA_EVIDENCE")
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| dir.join("evidence.jsonl"))
+            }))
+        },
         edge_url: o.edge_url.clone(),
         revoked: o.revoked.iter().cloned().collect(),
         approval_vk: ed_key(dir, "approval.key").verifying_key(),
@@ -377,7 +398,8 @@ fn main() {
         }
         "bench" => {
             let d = need_dir();
-            let o = opts(&a[2..]);
+            let mut o = opts(&a[2..]);
+            o.no_evidence |= o.evidence.is_none(); // in-memory chain only, unless --evidence given
             bench(&d, &o);
         }
         "doctor" => {
@@ -566,9 +588,16 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
                         },
                     ),
                 )
+                .route("/healthz", get(|| async { "ok" }))
+                // Evidence export: approver bearer token (entries carry salted arg digests, decisions, reasons).
                 .route(
                     "/v1/evidence",
-                    get(|State(s): State<S>| async move { Json(s.e.entries()) }),
+                    get(|State(s): State<S>, h: HeaderMap| async move {
+                        if !authed(&h, &s.token) {
+                            return Err(StatusCode::UNAUTHORIZED);
+                        }
+                        Ok(Json(s.e.entries()))
+                    }),
                 )
                 .with_state(st)
 }

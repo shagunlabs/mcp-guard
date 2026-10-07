@@ -1,0 +1,12 @@
+# Minimal Sentryra Edge image: static musl binaries on scratch, non-root, no shell.
+# Build the binaries first (see docs/RUNBOOK.md and deploy/container/build.sh).
+FROM scratch
+COPY --chmod=0555 dist/sentryra-edge /sentryra-edge
+COPY --chmod=0555 dist/sentryra-verify /sentryra-verify
+COPY --chown=65532:65532 dist/rootfs/ /
+USER 65532:65532
+# /keys: key directory (read-only mount). /data: evidence log (writable volume).
+ENV SENTRYRA_EVIDENCE=/data/evidence.jsonl HOME=/data
+EXPOSE 8787
+ENTRYPOINT ["/sentryra-edge"]
+CMD ["serve", "/keys", "--addr", "0.0.0.0:8787", "--mode", "shadow", "--catalogue", "/keys/catalogue.json"]
