@@ -456,3 +456,48 @@ fn nested_signed_context_resolves_and_missing_ref_escalates() {
     let (e, t) = binding_engine(Some(serde_json::json!({"ticket": {"requester": "bob"}})));
     assert_eq!(e.decide(&breq(&t, "alice", None)).decision, "escalate");
 }
+
+#[test]
+fn regression_over_005_purpose_does_not_clear_sql_identifiers() {
+    // purpose mentions `users`, ticket mentions `users`, no sql.tables: must escalate
+    let (e, _, root) = engine(Mode::Enforce);
+    let mut m: serde_json::Value = serde_json::from_str(&mandate_json()).unwrap();
+    m["purpose"] = serde_json::json!("Report how many users exist in demo_shop");
+    m["scopes"] = serde_json::json!([{"tool": "db.query", "resource": "db:demo", "effect": "allow",
+        "constraints": {"sql.statement_types": ["SELECT"]}}]);
+    let t = token::issue(&Mandate::from_json(&m.to_string()).unwrap(), &root)
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    e.observe_output(
+        "db.query",
+        "ticket text: how many users do we have in demo_shop?",
+    );
+    let r = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "SELECT count(*) FROM users"}),
+    ));
+    assert!(r.tainted, "{:?}", r.reasons);
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+}
+
+#[test]
+fn signed_context_value_clears_sql_identifier() {
+    let (e, _, root) = engine(Mode::Enforce);
+    let mut m: serde_json::Value = serde_json::from_str(&mandate_json()).unwrap();
+    m["scopes"] =
+        serde_json::json!([{"tool": "db.query", "resource": "db:demo", "effect": "allow"}]);
+    m["context"] = serde_json::json!({"report": {"table": "users"}});
+    let t = token::issue(&Mandate::from_json(&m.to_string()).unwrap(), &root)
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    e.observe_output("db.query", "ticket text: how many users do we have?");
+    let r = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "SELECT count(*) FROM users"}),
+    ));
+    assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+}

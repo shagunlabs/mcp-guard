@@ -307,9 +307,23 @@ impl Engine {
             .unwrap_or_default();
         // Tables the mandate allows (`sql.tables` in any matching scope) are trusted SQL identifiers:
         // an allowed table name appearing in untrusted text does not taint a query.
+        // The free-text `purpose` does NOT clear SQL identifiers: only structured constraint values
+        // (`sql.tables`) and string values of the signed mandate `context` may.
         let sql_trusted: HashSet<String> = {
-            let mut t = trusted.clone();
+            let mut t: HashSet<String> = HashSet::new();
             if let Ok(v) = verified.as_ref() {
+                let ctx = bindings::merge(&v.context, None, "");
+                for val in ctx.values() {
+                    let vs = match val {
+                        serde_json::Value::Array(a) => a.clone(),
+                        x => vec![x.clone()],
+                    };
+                    t.extend(
+                        vs.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(|x| x.trim().to_lowercase()),
+                    );
+                }
                 for (_, c) in &v.scopes {
                     if let Some(a) = c.get("sql.tables").and_then(|x| x.as_array()) {
                         t.extend(a.iter().filter_map(|x| x.as_str()).map(|x| {
