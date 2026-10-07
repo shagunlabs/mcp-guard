@@ -530,13 +530,14 @@ impl Engine {
             let ap = t2::rules::apply(tier1, class, &res, &c.cfg);
             let via: Vec<String> = ap.via.iter().map(|v| format!("{v:?}")).collect();
             reasons.push(format!(
-                "tier2: {} req={rid} class={} via=[{}] {}",
+                "tier2: {} req={rid} class={} cfg={} via=[{}] {}",
                 if ap.tier2_escalate {
                     "escalate"
                 } else {
                     "none"
                 },
                 class.wire(),
+                c.config_version,
                 via.join(","),
                 ap.export()
             ));

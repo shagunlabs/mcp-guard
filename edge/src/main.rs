@@ -21,7 +21,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
       --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>
-      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-threshold 0.50] [--tier2-log <jsonl>]
+      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
       [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -62,10 +62,10 @@ struct Opts {
     t2_scorer: Option<PathBuf>,
     t2_python: String,
     t2_deadline_ms: u64,
-    t2_threshold: f64,
     t2_log: Option<PathBuf>,
     t2_diag: bool,
     t2_allowlist: Option<PathBuf>,
+    t2_config: Option<PathBuf>,
 }
 
 fn opts(args: &[String]) -> Opts {
@@ -79,10 +79,10 @@ fn opts(args: &[String]) -> Opts {
         t2_scorer: None,
         t2_python: "python3".into(),
         t2_deadline_ms: 10,
-        t2_threshold: 0.50,
         t2_log: None,
         t2_diag: false,
         t2_allowlist: None,
+        t2_config: None,
         addr: "127.0.0.1:8787".into(),
         n: 20000,
         rest: vec![],
@@ -113,9 +113,7 @@ fn opts(args: &[String]) -> Opts {
             "--tier2-deadline-ms" => {
                 o.t2_deadline_ms = v().parse().unwrap_or_else(|_| die("--tier2-deadline-ms"))
             }
-            "--tier2-threshold" => {
-                o.t2_threshold = v().parse().unwrap_or_else(|_| die("--tier2-threshold"))
-            }
+            "--tier2-config" => o.t2_config = Some(v().into()),
             "--tier2-log" => o.t2_log = Some(v().into()),
             "--tier2-allowlist" => o.t2_allowlist = Some(v().into()),
             "--tier2-diag" => {
@@ -175,32 +173,55 @@ fn engine(dir: &Path, o: &Opts) -> Engine {
 /// Start the Tier 2 sidecar (one process = one scoring session) if `--tier2-scorer` is set.
 /// The model digest must be on the allowlist (pinned copy by default) or the Edge refuses to start.
 fn attach_tier2(e: &mut Engine, o: &Opts) {
-    use sentryra_sidecar_risk::{allowlist, client, rules};
+    use sentryra_sidecar_risk::{allowlist, client, config, rules};
     let Some(dir) = &o.t2_scorer else { return };
     let allow = match &o.t2_allowlist {
         Some(p) => allowlist::parse(&read(p)),
         None => allowlist::parse(allowlist::PINNED),
     }
     .unwrap_or_else(|e| die(format!("tier2 allowlist: {e:?}")));
+    // Versioned scorer config: pinned v0 by default, or a file (e.g. a later V1) — no code change.
+    let (cfg_text, cfg_path) = match &o.t2_config {
+        Some(p) => (read(p), p.clone()),
+        None => {
+            let p = std::env::temp_dir()
+                .join(format!("sentryra-t2-config-{}.json", std::process::id()));
+            std::fs::write(&p, config::PINNED_V0).unwrap_or_else(|e| die(e));
+            (config::PINNED_V0.to_string(), p)
+        }
+    };
+    let sc = config::ScorerConfig::parse(&cfg_text)
+        .unwrap_or_else(|e| die(format!("tier2 config: {e}")));
+    let rcfg = rules::Config {
+        threshold: sc.threshold,
+        near_margin: sc.near_margin,
+        deadline_ms: o.t2_deadline_ms,
+    };
     let sock = std::env::temp_dir().join(format!("sentryra-t2-{}.sock", std::process::id()));
-    let c = client::Client::spawn(client::SpawnOpts {
+    let c = match client::Client::spawn(client::SpawnOpts {
         python: o.t2_python.clone(),
         server: client::default_server(),
         scorer_dir: dir.clone(),
         socket: sock,
         allowlist: allow,
         log: o.t2_log.clone(),
-        cfg: rules::Config {
-            threshold: o.t2_threshold,
-            near_margin: 0.03,
-            deadline_ms: o.t2_deadline_ms,
-        },
-    })
-    .unwrap_or_else(|e| die(format!("tier2: {}", e.0)));
-    eprintln!(
-        "[sentryra] tier2 scorer up: model sha256:{} deadline {} ms threshold {}",
-        c.model_digest, o.t2_deadline_ms, o.t2_threshold
-    );
+        cfg: rcfg,
+        scorer_config: sc.clone(),
+        scorer_config_path: cfg_path,
+    }) {
+        Ok(c) => {
+            eprintln!(
+                "[sentryra] tier2 scorer up: config {} model sha256:{} deadline {} ms threshold {}",
+                sc.config_version, c.model_digest, o.t2_deadline_ms, sc.threshold
+            );
+            c
+        }
+        Err(e) => {
+            // Refused to start (digest / config / determinism): fail closed, never die silently.
+            eprintln!("[sentryra] tier2 UNAVAILABLE (fail closed: external_send/destructive/privilege escalate): {}", e.0);
+            client::Client::dead(rcfg, sc.config_version.clone(), e.0)
+        }
+    };
     e.set_tier2(Arc::new(c), o.t2_diag);
 }
 

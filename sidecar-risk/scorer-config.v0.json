@@ -1,0 +1,12 @@
+{
+  "config_version": "t2cfg-v0",
+  "scorer_version": "t2-scorer-0.1.0",
+  "model_sha256": "7304e205d537eff13b20c2d104e4d6664b7a603945fdcc5909f3817bdaf20a05",
+  "weights_file": "weights.json",
+  "weights_sha256": "d2f9c30cd424874896f7da291a2dbff4773914e939702a08d4070cc195db1a3d",
+  "threshold": 0.50,
+  "near_margin": 0.03,
+  "probe_reference_file": "handoff/probe-reference.json",
+  "probe_reference_sha256": null,
+  "probe_tolerance": 0.005
+}

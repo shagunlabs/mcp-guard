@@ -18,12 +18,16 @@ use std::time::{Duration, Instant};
 type Waiters = Arc<Mutex<HashMap<u64, Sender<Value>>>>;
 
 pub struct Client {
-    w: Mutex<UnixStream>,
+    w: Mutex<Option<UnixStream>>,
     waiters: Waiters,
     pending_ingest: Arc<Mutex<HashMap<String, HashSet<u64>>>>,
     next: AtomicU64,
     pub cfg: Config,
     pub model_digest: String,
+    /// Versioned scorer config in force (recorded in every decision).
+    pub config_version: String,
+    /// Why the sidecar is unavailable (refused to start); every call then returns Unavailable.
+    pub dead: Option<String>,
     child: Mutex<Option<Child>>,
 }
 
@@ -39,6 +43,9 @@ pub struct SpawnOpts {
     /// Data-plane log of every scorer reply incl. late ones and per-window diagnostics.
     pub log: Option<PathBuf>,
     pub cfg: Config,
+    pub scorer_config: crate::config::ScorerConfig,
+    /// Path of the config file passed to the scorer process (it re-verifies weights + threshold).
+    pub scorer_config_path: PathBuf,
 }
 
 impl Client {
@@ -48,8 +55,22 @@ impl Client {
         let model = o.scorer_dir.join("onnx/model_int8.onnx");
         let digest = allowlist::verify(&model, &o.allowlist)
             .map_err(|e| ClientError(format!("refusing to load Tier 2 model: {e:?}")))?;
+        if digest != o.scorer_config.model_sha256 {
+            return Err(ClientError(format!(
+                "config {} pins model {} but file is {digest}",
+                o.scorer_config.config_version, o.scorer_config.model_sha256
+            )));
+        }
+        let w = allowlist::sha256_file(&o.scorer_dir.join(&o.scorer_config.weights_file))
+            .map_err(|e| ClientError(format!("weights: {e:?}")))?;
+        if w != o.scorer_config.weights_sha256 {
+            return Err(ClientError(format!(
+                "weights sha256 {w} != config {} pin",
+                o.scorer_config.config_version
+            )));
+        }
         let _ = std::fs::remove_file(&o.socket);
-        let child = Command::new(&o.python)
+        let mut child = Command::new(&o.python)
             .arg(&o.server)
             .arg("--scorer-dir")
             .arg(&o.scorer_dir)
@@ -57,6 +78,8 @@ impl Client {
             .arg(&o.socket)
             .arg("--expect-sha256")
             .arg(&digest)
+            .arg("--config")
+            .arg(&o.scorer_config_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
@@ -67,12 +90,21 @@ impl Client {
             match UnixStream::connect(&o.socket) {
                 Ok(s) => break s,
                 Err(_) if t0.elapsed() < Duration::from_secs(60) => {
+                    if let Ok(Some(st)) = child.try_wait() {
+                        return Err(ClientError(format!(
+                            "scorer refused to start ({st}); see its stderr"
+                        )));
+                    }
                     std::thread::sleep(Duration::from_millis(50))
                 }
-                Err(e) => return Err(ClientError(format!("connect {}: {e}", o.socket.display()))),
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(ClientError(format!("connect {}: {e}", o.socket.display())));
+                }
             }
         };
-        let c = Self::from_stream(s, o.cfg, digest.clone(), o.log)?;
+        let mut c = Self::from_stream(s, o.cfg, digest.clone(), o.log)?;
+        c.config_version = o.scorer_config.config_version.clone();
         *c.child.lock().unwrap() = Some(child);
         let hello = c
             .call(json!({"op": "hello"}), Duration::from_secs(60))
@@ -86,6 +118,23 @@ impl Client {
                 "scorer digest {got} != allowlisted {digest}"
             )));
         }
+        if hello.get("config_version").and_then(|v| v.as_str()) != Some(c.config_version.as_str()) {
+            return Err(ClientError(format!(
+                "scorer config {:?} != {}",
+                hello.get("config_version"),
+                c.config_version
+            )));
+        }
+        if hello.get("determinism_ok") != Some(&json!(true)) {
+            return Err(ClientError(format!(
+                "scorer probe self-check failed: {}",
+                hello.get("determinism").cloned().unwrap_or_default()
+            )));
+        }
+        eprintln!(
+            "[sentryra] tier2 probe self-check passed: {}",
+            hello.get("determinism").cloned().unwrap_or_default()
+        );
         Ok(c)
     }
 
@@ -139,18 +188,37 @@ impl Client {
             }
         });
         Ok(Client {
-            w: Mutex::new(s),
+            w: Mutex::new(Some(s)),
             waiters,
             pending_ingest: pending,
             next: AtomicU64::new(1),
             cfg,
             model_digest,
+            config_version: String::new(),
+            dead: None,
             child: Mutex::new(None),
         })
     }
 
+    /// A sidecar that refused to start (digest, config or probe self-check failure). Fail closed:
+    /// every call is `Unavailable`, which escalates destructive / privilege / external_send.
+    pub fn dead(cfg: Config, config_version: String, reason: String) -> Client {
+        Client {
+            w: Mutex::new(None),
+            waiters: Arc::default(),
+            pending_ingest: Arc::default(),
+            next: AtomicU64::new(1),
+            cfg,
+            model_digest: String::new(),
+            config_version,
+            dead: Some(reason),
+            child: Mutex::new(None),
+        }
+    }
+
     fn send(&self, v: &Value) -> bool {
-        let mut w = self.w.lock().unwrap();
+        let mut g = self.w.lock().unwrap();
+        let Some(w) = g.as_mut() else { return false };
         writeln!(w, "{v}").and_then(|_| w.flush()).is_ok()
     }
 
@@ -223,6 +291,9 @@ impl Client {
         let mut v = serde_json::to_value(&req).unwrap();
         if diag {
             v["diag"] = json!(true);
+        }
+        if self.dead.is_some() {
+            return (id, T2Result::Unavailable);
         }
         if !self.cache_ready(session) {
             // Cache not ready => treated as a timeout. Still sent so the raw score is logged.
@@ -397,5 +468,34 @@ mod t {
         );
         // other sessions are unaffected
         assert!(c.cache_ready("other"));
+    }
+}
+
+#[cfg(test)]
+mod dead_t {
+    use super::*;
+    use crate::rules::apply;
+    use crate::Outcome;
+    #[test]
+    fn refused_sidecar_fails_closed() {
+        let c = Client::dead(Config::default(), "t2cfg-v0".into(), "determinism".into());
+        let (_, r) = c.score(
+            "s",
+            "p",
+            "mail.send",
+            SideEffect::ExternalSend,
+            "r",
+            &json!({}),
+            false,
+        );
+        assert!(matches!(r, T2Result::Unavailable));
+        assert_eq!(
+            apply(Outcome::Allow, SideEffect::ExternalSend, &r, &c.cfg).outcome,
+            Outcome::Escalate
+        );
+        assert_eq!(
+            apply(Outcome::Allow, SideEffect::Read, &r, &c.cfg).outcome,
+            Outcome::Allow
+        );
     }
 }

@@ -8,6 +8,7 @@
 //! - **One scoring session per sidecar** (no parallel INT8 ORT sessions: HANDOFF §6).
 pub mod allowlist;
 pub mod client;
+pub mod config;
 pub mod rules;
 pub mod types;
 
