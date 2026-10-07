@@ -1,6 +1,8 @@
 # Not run remotely yet (no remote configured). Security gates per tech-stack.md §3.
+# Planned repo: github.com/shagunlabs/sentryra (placeholder org, to be confirmed). No remote configured.
 name: ci
 on: [push, pull_request]
+env: { GITHUB_ORG: shagunlabs }  # placeholder
 permissions: { contents: read }
 jobs:
   rust:

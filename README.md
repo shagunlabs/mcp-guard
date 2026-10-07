@@ -21,3 +21,10 @@ Threat model: `../engineering/threat-model.md`.
 cargo build --workspace && cargo test --workspace
 cargo run -p sentryra-edge -- spec/examples/mandate-v0.json k8s.apply cluster:prod/ns:billing   # Escalate
 ```
+
+## Licensing
+- **Apache-2.0** (`LICENSE`): Edge proxy/PDP (`edge/`), data-plane crates (`crates/*`, `sidecar-risk/`), `verify/`, `spec/`, SDKs (`sdk/*`).
+- **Proprietary** (`control/LICENSE`): control plane — `publish = false`, `license = "LicenseRef-Shagun-Proprietary"`.
+
+## Repository
+Planned home: `github.com/shagunlabs/sentryra` (org name **placeholder, to be confirmed**). No remote is configured; nothing has been pushed.
