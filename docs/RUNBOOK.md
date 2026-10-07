@@ -7,19 +7,36 @@ The Edge sits between your agent and its tools. For every tool call it checks th
 **Container (recommended).** The image is `sentryra-edge:0.0.1`. It holds static musl binaries on `scratch`: no shell, no package manager, and it runs as uid 65532.
 
     podman load -i sentryra-edge-0.0.1.tar        # or pull from your registry
-    cosign verify --key cosign.dev.pub --insecure-ignore-tlog=true <registry>/sentryra-edge@sha256:<digest>
+    cosign verify --key cosign.DEV-NOT-FOR-RELEASE.pub --insecure-ignore-tlog=true <registry>/sentryra-edge@sha256:<digest>
 
 **Static binary** (any x86_64 Linux, no dependencies):
 
-    cosign verify-blob --key cosign.dev.pub --insecure-ignore-tlog=true \
+    cosign verify-blob --key cosign.DEV-NOT-FOR-RELEASE.pub --insecure-ignore-tlog=true \
       --bundle sentryra-edge.sigstore.json sentryra-edge && sha256sum -c sentryra-edge.sha256
     install -m 0755 sentryra-edge /usr/local/bin/
 
 The SBOMs are CycloneDX JSON: `sbom.cargo.cdx.json` is the Rust dependency graph from Cargo.lock, and `sbom.image.cdx.json` covers the image contents. The image SBOM is also attached as a signed cosign attestation (`cosign verify-attestation --type cyclonedx …`).
 
-**Signing (dev key).** `deploy/container/sign.sh` signs with a LOCAL cosign key pair, not keyless (keyless needs an OIDC sign-in). The private key stays outside the repo in `~/.sentryra-signing/` (`cosign.key`, password in `cosign.pass`, both 0600). Only `deploy/signing/cosign.dev.pub` is committed. Signatures skip the public transparency log, so verify with `--insecure-ignore-tlog=true`. Swap in your production key or keyless before a real release.
+> **`cosign.DEV-NOT-FOR-RELEASE.pub` is NOT a release key.** It only verifies local development builds. Never trust it for a production or design-partner build. Release builds are signed keyless by the `shagunlabs` org workflow; see "Verifying a release" below.
+
+**Signing (dev key).** `deploy/container/sign.sh` signs with a LOCAL cosign key pair, not keyless (keyless needs an OIDC sign-in). The private key stays outside the repo in `~/.sentryra-signing/` (`cosign.key`, password in `cosign.pass`, both 0600). Only `deploy/signing/cosign.DEV-NOT-FOR-RELEASE.pub` is committed. Signatures skip the public transparency log, so verify with `--insecure-ignore-tlog=true`. Real releases use keyless signing from `.github/workflows/release.yml`, never this key.
 
 Build steps: `deploy/container/build.sh` (musl build, then the image), then `deploy/container/sign.sh` (SBOMs, signatures, local-registry push, then verify). `deploy/container/smoke.sh` is the container smoke test.
+
+### Verifying a release (keyless)
+
+Tagged releases (`v*`) are built by `.github/workflows/release.yml` in the `shagunlabs` GitHub org, pushed to `ghcr.io/shagunlabs/sentryra-edge`, and signed with cosign keyless: a short-lived Fulcio certificate bound to that workflow's GitHub OIDC identity, logged in the public Rekor transparency log. There is no long-lived private key. Verify by pinning both the identity and the issuer:
+
+    ID='^https://github\.com/shagunlabs/[^/]+/\.github/workflows/release\.yml@refs/tags/v.*$'
+    ISS=https://token.actions.githubusercontent.com
+    cosign verify --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISS" \
+      ghcr.io/shagunlabs/sentryra-edge@sha256:<digest>
+    cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$ID" \
+      --certificate-oidc-issuer "$ISS" ghcr.io/shagunlabs/sentryra-edge@sha256:<digest>
+    cosign verify-blob --bundle sentryra-edge.sigstore.json --certificate-identity-regexp "$ID" \
+      --certificate-oidc-issuer "$ISS" sentryra-edge
+
+Always verify by digest, not tag. Do not use `--insecure-ignore-tlog` for releases. A signature from any other org, repo workflow or non-tag ref fails the regexp and must be rejected.
 
 ## 2. Pre-flight: `edge doctor`
 

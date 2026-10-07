@@ -15,7 +15,7 @@ $SYFT scan dir:. --override-default-catalogers rust-cargo-lock-cataloger --exclu
 for b in sentryra-edge sentryra-verify; do
   (cd "$OUT" && sha256sum "$b" > "$b.sha256")
   $COSIGN sign-blob --yes --key "$KEYDIR/cosign.key" --tlog-upload=false --use-signing-config=false --bundle "$OUT/$b.sigstore.json" "$OUT/$b" >/dev/null
-  $COSIGN verify-blob --key deploy/signing/cosign.dev.pub --insecure-ignore-tlog=true --bundle "$OUT/$b.sigstore.json" "$OUT/$b"
+  $COSIGN verify-blob --key deploy/signing/cosign.DEV-NOT-FOR-RELEASE.pub --insecure-ignore-tlog=true --bundle "$OUT/$b.sigstore.json" "$OUT/$b"
 done
 # Image: push to a LOCAL registry (127.0.0.1 only), sign by digest, attach the SBOM as an attestation.
 podman push --tls-verify=false "$TAG" "$REG/$TAG" -q
@@ -24,5 +24,5 @@ REF="$REG/${TAG%%:*}@$DIG"
 $SYFT scan "registry:$REF" -o cyclonedx-json="$OUT/sbom.image.cdx.json" -q 2>/dev/null || SYFT_REGISTRY_INSECURE_USE_HTTP=true $SYFT scan "registry:$REF" -o cyclonedx-json="$OUT/sbom.image.cdx.json" -q
 $COSIGN sign --yes --key "$KEYDIR/cosign.key" --tlog-upload=false --use-signing-config=false --allow-insecure-registry --allow-http-registry "$REF" >/dev/null
 $COSIGN attest --yes --key "$KEYDIR/cosign.key" --tlog-upload=false --use-signing-config=false --allow-insecure-registry --allow-http-registry --type cyclonedx --predicate "$OUT/sbom.cargo.cdx.json" "$REF" >/dev/null
-$COSIGN verify --key deploy/signing/cosign.dev.pub --insecure-ignore-tlog=true --allow-insecure-registry --allow-http-registry "$REF" >/dev/null && echo "image signature verified: $REF"
+$COSIGN verify --key deploy/signing/cosign.DEV-NOT-FOR-RELEASE.pub --insecure-ignore-tlog=true --allow-insecure-registry --allow-http-registry "$REF" >/dev/null && echo "image signature verified: $REF"
 echo "$DIG" > "$OUT/image.digest"

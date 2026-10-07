@@ -1,0 +1,68 @@
+# Release: on tag push v*, build static musl binaries + scratch image, CycloneDX SBOMs, push to
+# ghcr.io/shagunlabs, and sign + attest with cosign KEYLESS (GitHub OIDC -> Fulcio cert, Rekor).
+# No long-lived signing key exists. Identity = this workflow in the shagunlabs org at a v* tag.
+# Not run yet: no remote configured. Protect tags v* (only org owners) before the first release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+permissions: {}            # default deny; the job below grants only what it needs
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    if: github.repository_owner == 'shagunlabs'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read       # checkout
+      packages: write      # push to ghcr.io/shagunlabs
+      id-token: write      # GitHub OIDC token for cosign keyless
+    env:
+      IMAGE: ghcr.io/shagunlabs/sentryra-edge
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with: { persist-credentials: false, fetch-depth: 0 }
+      - uses: sigstore/cosign-installer@d58896d6a1865668819e1d91763c7751a165e159 # v3.9.2
+      - uses: anchore/sbom-action/download-syft@da167eac915b4e86f08b264dbdbc867b61be6f0c # v0.20.5
+      - name: Toolchain (pinned by rust-toolchain.toml) + musl target
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+          rustup show active-toolchain
+          rustup target add x86_64-unknown-linux-musl
+      - name: Build static binaries and scratch image (no dev-export feature)
+        env:
+          TAG: "sentryra-edge:${{ github.ref_name }}"
+        run: deploy/container/build.sh
+      - name: SBOMs (CycloneDX)
+        run: |
+          D=deploy/container/dist
+          syft scan dir:. --override-default-catalogers rust-cargo-lock-cataloger --exclude ./target \
+            --exclude ./deploy/container/dist --source-name sentryra-edge --source-version "${GITHUB_REF_NAME#v}" \
+            -o cyclonedx-json="$D/sbom.cargo.cdx.json"
+          syft "containers-storage:localhost/sentryra-edge:${GITHUB_REF_NAME}" -o cyclonedx-json="$D/sbom.image.cdx.json"
+      - name: Push to ghcr.io
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          echo "$GH_TOKEN" | podman login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          podman push --digestfile digest "localhost/sentryra-edge:${GITHUB_REF_NAME}" "docker://${IMAGE}:${GITHUB_REF_NAME}"
+          echo "REF=${IMAGE}@$(cat digest)" >> "$GITHUB_ENV"
+          podman logout ghcr.io
+      - name: Sign + attest (keyless)
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          D=deploy/container/dist
+          echo "$GH_TOKEN" | docker login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin  # cosign uses docker config
+          cosign sign --yes "$REF"
+          cosign attest --yes --type cyclonedx --predicate "$D/sbom.image.cdx.json" "$REF"
+          for b in sentryra-edge sentryra-verify; do
+            cosign sign-blob --yes --bundle "$D/$b.sigstore.json" "$D/$b"
+          done
+          ID='^https://github\.com/shagunlabs/[^/]+/\.github/workflows/release\.yml@refs/tags/v.*$'
+          ISS=https://token.actions.githubusercontent.com
+          cosign verify --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISS" "$REF" >/dev/null
+          cosign verify-attestation --type cyclonedx --certificate-identity-regexp "$ID" --certificate-oidc-issuer "$ISS" "$REF" >/dev/null
+          echo "signed and verified: $REF" >> "$GITHUB_STEP_SUMMARY"
+          docker logout ghcr.io

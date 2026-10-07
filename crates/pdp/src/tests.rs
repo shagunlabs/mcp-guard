@@ -810,3 +810,46 @@ fn dev_export_is_off_without_feature() {
         sentryra_sidecar_risk::client::Client::dev_export_compiled()
     );
 }
+
+/// DPA clause (Brahma): signed mandate context values never leave the Edge raw. Every outbound
+/// decision record (the evidence chain served by GET /v1/evidence and written to evidence.jsonl,
+/// which is what the control plane receives) may carry only the mandate ID, field names and salted
+/// hashes of those values.
+#[test]
+fn no_raw_signed_context_value_in_outbound_records() {
+    let raw = [
+        "tenant-RAW-7f3a91",
+        "requester.raw.c41d@customer.example",
+        "TICKET-RAW-55821",
+        "ORDER-RAW-90417",
+        "4242.17",
+    ];
+    let ctx = serde_json::json!({
+        "session.tenant": raw[0], "ticket.requester": raw[1], "ticket.id": raw[2],
+        "order": {"id": raw[3]}, "amount": raw[4].parse::<f64>().unwrap(),
+    });
+    let (e, t) = binding_engine(Some(ctx));
+    // allow (bound value matches), deny (mismatch), and a call whose args are unrelated.
+    assert_eq!(e.decide(&breq(&t, raw[0], None)).decision, "allow");
+    assert_eq!(e.decide(&breq(&t, "mallory", None)).decision, "deny");
+    let _ = e.decide(&req(
+        &t,
+        "mail.send",
+        serde_json::json!({"to": "x@acme.example"}),
+    ));
+    let entries = e.entries();
+    assert!(entries.len() >= 3);
+    for en in &entries {
+        let out = serde_json::to_string(en).unwrap();
+        for v in raw {
+            assert!(
+                !out.contains(v),
+                "raw context value {v:?} leaked in outbound record: {out}"
+            );
+        }
+        assert_eq!(en.mandate_id, "mdt_test");
+        for h in [&en.args_hmac, &en.principal_hmac] {
+            assert!(h.len() == 64 && h.chars().all(|c| c.is_ascii_hexdigit()));
+        }
+    }
+}
