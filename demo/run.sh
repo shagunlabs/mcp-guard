@@ -14,7 +14,7 @@ cat > "$R/mandate.json" <<J
 {"mandate_id":"mdt_demo","spec":"sentryra.mandate/v0","tenant":"org_demo",
  "principal":{"id":"priya@acme.example"},"agent":{"id":"agt_support"},
  "purpose":"Answer support tickets using read-only lookups in the demo DB",
- "scopes":[{"tool":"db.query","resource":"db:demo","effect":"allow"},
+ "scopes":[{"tool":"db.query","resource":"db:demo","effect":"allow","constraints":{"sql.tables":["users","tickets"]}},
            {"tool":"db.admin","resource":"unknown","effect":"allow"}],
  "default_effect":"deny","not_before":"$NBF","expires_at":"$EXP"}
 J
