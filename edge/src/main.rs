@@ -21,6 +21,8 @@ const USAGE: &str = "usage: sentryra-edge <command>
   mcp-proxy <keydir> [opts] -- <server cmd...>  stdio MCP proxy (mandate from $SENTRYRA_MANDATE, trusted host context JSON from $SENTRYRA_CONTEXT)
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
+  t2-context --case <case.json> [--names-only]  DEV: print the context signed-context list + recipient set the Edge bridge
+                                                builds for each sink call (values included unless --names-only)
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
       --policies <file.cedar> (default: compiled-in) --evidence <file.jsonl> (default: <keydir>/evidence.jsonl; --no-evidence to disable) --revoked <id,...> --edge-url <url>
       --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-dev-export (dev-export builds only; fixture mandates only)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
@@ -292,6 +294,89 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
     e.set_tier2_dev_export(o.t2_dev_export);
 }
 
+/// DEV: run the Edge -> context bridge (`sentryra_sidecar_risk::context_bridge::bridge`, the function the Edge
+/// uses) over a bench-schema case: the mandate goes through the Edge's own loader, scopes match the
+/// call like the verifier does (exact tool, glob resource), sink = write / external_send.
+fn t2_context(a: &[String]) {
+    use sentryra_sidecar_risk::{context_bridge, types::SideEffect};
+    let mut case_path = None;
+    let mut names_only = false;
+    let mut i = 0;
+    while i < a.len() {
+        match a[i].as_str() {
+            "--case" => {
+                case_path = a.get(i + 1).cloned();
+                i += 1;
+            }
+            "--names-only" => names_only = true,
+            x => die(format!("t2-context: unknown argument {x}\n{USAGE}")),
+        }
+        i += 1;
+    }
+    let p = case_path.unwrap_or_else(|| die("t2-context needs --case <case.json>"));
+    let case: serde_json::Value =
+        serde_json::from_str(&read(&p)).unwrap_or_else(|e| die(format!("{p}: {e}")));
+    let id = case
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let m = Mandate::from_json(&case["mandate"].to_string())
+        .unwrap_or_else(|e| die(format!("{id}: Edge mandate load failed: {e:?}")));
+    let cls: std::collections::HashMap<String, Option<String>> = case["tool_catalogue"]
+        .as_array()
+        .map(|t| {
+            t.iter()
+                .map(|x| {
+                    (
+                        x["name"].as_str().unwrap_or("").to_string(),
+                        x["side_effect_class"].as_str().map(String::from),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut calls = vec![];
+    for c in case["calls"].as_array().cloned().unwrap_or_default() {
+        let tool = c["tool"].as_str().unwrap_or("");
+        let class = SideEffect::parse(cls.get(tool).and_then(|x| x.as_deref()));
+        if !matches!(class, SideEffect::Write | SideEffect::ExternalSend) {
+            continue;
+        }
+        let res = c["resource"].as_str().unwrap_or("");
+        let cons: Vec<serde_json::Value> = m
+            .scopes
+            .iter()
+            .filter(|s| {
+                s.tool == tool && sentryra_mandate::token::resource_matches(&s.resource, res)
+            })
+            .filter_map(|s| s.constraints.clone())
+            .collect();
+        let args = c.get("args").cloned().unwrap_or(serde_json::Value::Null);
+        let b = context_bridge::bridge(&m.context, cons.iter(), &args);
+        let mut o = serde_json::json!({
+            "step": c["step"], "tool": tool, "side_effect": class.wire(),
+            "resolved_bindings": b.resolved_bindings, "unresolved_bindings": b.unresolved_bindings,
+        });
+        if names_only {
+            o["context"] = b.context.iter().map(|f| serde_json::json!({
+                "field": f.field, "party": f.party.as_ref().map(|p| {
+                    if b.recipient.len() == 1 && p.trim().eq_ignore_ascii_case(b.recipient[0].trim()) { "=recipient" } else { "<other>" }
+                })})).collect();
+            o["recipient_count"] = b.recipient.len().into();
+        } else {
+            o["context"] = serde_json::to_value(&b.context).unwrap();
+            o["context_bridge"] = serde_json::Value::Array(b.wire_context());
+            o["recipient"] = serde_json::to_value(&b.recipient).unwrap();
+        }
+        calls.push(o);
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({"case": id, "calls": calls})).unwrap()
+    );
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = a.first() else { die(USAGE) };
@@ -376,6 +461,7 @@ fn main() {
                 println!("{id}");
             }
         }
+        "t2-context" => t2_context(&a[1..]),
         "serve" => {
             let d = need_dir();
             let o = opts(&a[2..]);
