@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
+sentryra-sidecar-risk = { path = "../../sidecar-risk" }
 sentryra-mandate = { path = "../mandate" }
 sentryra-evidence = { path = "../evidence" }
 sentryra-connector-manifest = { path = "../connector-manifest" }

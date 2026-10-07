@@ -1,5 +1,8 @@
 //! M2 Tier 1 decision core: Biscuit mandate + signed tool catalogue + Cedar + SQL parse + taint,
 //! in shadow or enforce mode, with every decision written to the signed evidence chain.
+use sentryra_sidecar_risk as t2;
+/// Tier 2 session key: one agent session per Edge process (proxy). See README gaps.
+const T2_SESSION: &str = "edge";
 pub mod bindings;
 pub mod constraints;
 pub mod receipts;
@@ -118,6 +121,8 @@ pub struct Engine {
     approval_vk: VerifyingKey,
     approval_sk: Option<SigningKey>,
     state: Mutex<State>,
+    /// Optional Tier 2 sidecar (escalate-only). `diag` asks for per-window raw scores (bench).
+    tier2: Option<(std::sync::Arc<t2::client::Client>, bool)>,
 }
 
 #[derive(Debug)]
@@ -229,7 +234,17 @@ impl Engine {
                 counter: 0,
                 consumed: HashSet::new(),
             }),
+            tier2: None,
         })
+    }
+
+    /// Attach the Tier 2 sidecar. One sidecar (one scoring session) per Edge process.
+    pub fn set_tier2(&mut self, c: std::sync::Arc<t2::client::Client>, diag: bool) {
+        self.tier2 = Some((c, diag));
+    }
+
+    pub fn tier2(&self) -> Option<&std::sync::Arc<t2::client::Client>> {
+        self.tier2.as_ref().map(|t| &t.0)
     }
 
     pub fn evidence_public_key_hex(&self) -> String {
@@ -256,6 +271,9 @@ impl Engine {
     pub fn observe_output(&self, tool: &str, text: &str) {
         if self.output_untrusted(tool) {
             self.state.lock().unwrap().taint.ingest(text);
+            if let Some((c, _)) = &self.tier2 {
+                c.ingest(T2_SESSION, text); // async: embedded in the sidecar, off the response path
+            }
         }
     }
 
@@ -376,6 +394,10 @@ impl Engine {
         let base = constraints::baseline(&req.args, def);
         reasons.extend(base.reasons.iter().cloned());
         let mut vouched: HashSet<String> = HashSet::new();
+        let purpose = verified
+            .as_ref()
+            .map(|v| v.purpose.clone())
+            .unwrap_or_default();
         let (mandate_id, principal, mut mandate_effect) = match verified {
             Ok(v) => {
                 if v.scopes.is_empty() {
@@ -483,6 +505,46 @@ impl Engine {
         let (mut decision, mut policy_ids) = self.cedar(&req.tool, &resource, &principal, ctx);
         if decision == "deny" && reasons.is_empty() {
             reasons.push("no permit matched (default deny)".into());
+        }
+
+        // Tier 2 (escalate-only): may raise allow -> escalate; never lowers, never allows.
+        if let Some((c, diag)) = &self.tier2 {
+            let class = t2::types::SideEffect::parse(match def {
+                Some(d) => d.side_effect_class.as_deref().or(Some(if d.consequential {
+                    "write"
+                } else {
+                    "read"
+                })),
+                None => None, // uncatalogued => destructive
+            });
+            let tier1 = match decision.as_str() {
+                "allow" => t2::Outcome::Allow,
+                "escalate" => t2::Outcome::Escalate,
+                _ => t2::Outcome::Deny,
+            };
+            let mut a = req.args.clone();
+            if let Some(o) = a.as_object_mut() {
+                o.remove("resource");
+            }
+            let (rid, res) = c.score(T2_SESSION, &purpose, &req.tool, class, &resource, &a, *diag);
+            let ap = t2::rules::apply(tier1, class, &res, &c.cfg);
+            let via: Vec<String> = ap.via.iter().map(|v| format!("{v:?}")).collect();
+            reasons.push(format!(
+                "tier2: {} req={rid} class={} via=[{}] {}",
+                if ap.tier2_escalate {
+                    "escalate"
+                } else {
+                    "none"
+                },
+                class.wire(),
+                via.join(","),
+                ap.export()
+            ));
+            if ap.outcome == t2::Outcome::Escalate && tier1 == t2::Outcome::Allow {
+                decision = "escalate".into();
+                policy_ids.push("tier2-escalate".into());
+            }
+            debug_assert!(!(tier1 != t2::Outcome::Allow && decision == "allow"));
         }
 
         // Approval receipt: can turn an escalate into allow, exactly once, for exactly this action.

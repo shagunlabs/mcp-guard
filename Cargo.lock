@@ -1628,6 +1628,7 @@ dependencies = [
  "sentryra-evidence",
  "sentryra-mandate",
  "sentryra-pdp",
+ "sentryra-sidecar-risk",
  "serde",
  "serde_json",
  "tokio",
@@ -1668,6 +1669,7 @@ dependencies = [
  "sentryra-connector-manifest",
  "sentryra-evidence",
  "sentryra-mandate",
+ "sentryra-sidecar-risk",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1677,6 +1679,12 @@ dependencies = [
 [[package]]
 name = "sentryra-sidecar-risk"
 version = "0.0.1"
+dependencies = [
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
 
 [[package]]
 name = "sentryra-verify"

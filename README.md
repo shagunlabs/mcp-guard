@@ -75,3 +75,12 @@ Planned home `github.com/shagunlabs/sentryra` (org name **placeholder, to be con
 - `$name` bindings in constraints (e.g. `idp.users: ["$ticket.requester"]`) resolve only from trusted context: the signed mandate `context` (wins), host-supplied context (`SENTRYRA_CONTEXT` for the proxy, `context` on `/v1/decide`), and built-in `$principal.id`. Never from agent args or tool outputs. Unresolved bindings escalate.
 - SQL taint: the free-text `purpose` never clears SQL identifiers; only `sql.tables` and signed mandate `context` values do. Table names NOT so allowed, plus string and number literals, are taint-checked (columns/identifiers are not). Numeric literals 0–99 are ignored as non-identifying.
 - The proxy annotates every capped result with `_meta["com.sentryra/row_cap"] = {cap, truncated}`.
+
+## Tier 2 sidecar (sidecar-risk)
+- `sentryra-edge mcp-proxy ... --tier2-scorer <tier2-prototype dir>` starts ONE scorer process (one ONNX session, single-threaded) on a private unix socket (0600) and talks newline-delimited JSON. Nothing listens on TCP; the scorer runs in the data plane next to the Edge.
+- Model allowlist by sha256 (`sidecar-risk/model-allowlist.sha256`, pinned copy of the INT8 row in the internal licence register; exactly one hash). The Edge hashes the file and refuses to start the scorer on any other digest; the scorer re-checks before creating its session.
+- Per-call deadline `--tier2-deadline-ms` (default 10). Missed deadline, or untrusted-output cache not yet ready => `T2_TIMEOUT`; escalates for destructive / privilege / external_send, none + log for read / write. Late replies are logged (`--tier2-log`), never applied.
+- Threshold `--tier2-threshold` (default 0.50); `|score − threshold| ≤ 0.03` => `T2_NEAR_THRESHOLD`. Outbound sends with `windows_read < windows_total`, or either field missing / non-integer => `T2_PARTIAL_READ`.
+- Escalate-only: the final join is `sidecar_risk::combine`; Tier 2 never lowers a deny/escalate and never produces allow. Evidence carries only score, band and approver-visible codes (`T2_UNSCORABLE_PLACEHOLDER` is internal; unknown codes are dropped).
+- Untrusted outputs are sent to the scorer for embedding as they arrive (async).
+- Gaps: the Tier 2 session is per Edge process (fine for the stdio proxy; `serve` mixes mandates); the wire is JSON over UDS, not the contract's gRPC; no `T2_UNAVAILABLE` alerting; per-window diagnostic scores (`--tier2-diag`) are computed at shutdown, off the decision path.

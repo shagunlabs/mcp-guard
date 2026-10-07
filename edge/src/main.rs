@@ -20,7 +20,9 @@ const USAGE: &str = "usage: sentryra-edge <command>
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
 opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repeatable, needs .sig)
-      --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>";
+      --policies <file.cedar> --evidence <file.jsonl> --revoked <id,...> --edge-url <url>
+      --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-threshold 0.50] [--tier2-log <jsonl>]
+      [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)";
 
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("error: {msg}");
@@ -57,6 +59,13 @@ struct Opts {
     n: usize,
     rest: Vec<String>,
     flags: Vec<String>,
+    t2_scorer: Option<PathBuf>,
+    t2_python: String,
+    t2_deadline_ms: u64,
+    t2_threshold: f64,
+    t2_log: Option<PathBuf>,
+    t2_diag: bool,
+    t2_allowlist: Option<PathBuf>,
 }
 
 fn opts(args: &[String]) -> Opts {
@@ -67,6 +76,13 @@ fn opts(args: &[String]) -> Opts {
         evidence: None,
         revoked: vec![],
         edge_url: "http://127.0.0.1:8787".into(),
+        t2_scorer: None,
+        t2_python: "python3".into(),
+        t2_deadline_ms: 10,
+        t2_threshold: 0.50,
+        t2_log: None,
+        t2_diag: false,
+        t2_allowlist: None,
         addr: "127.0.0.1:8787".into(),
         n: 20000,
         rest: vec![],
@@ -92,6 +108,21 @@ fn opts(args: &[String]) -> Opts {
             "--evidence" => o.evidence = Some(v().into()),
             "--revoked" => o.revoked = v().split(',').map(String::from).collect(),
             "--edge-url" => o.edge_url = v(),
+            "--tier2-scorer" => o.t2_scorer = Some(v().into()),
+            "--tier2-python" => o.t2_python = v(),
+            "--tier2-deadline-ms" => {
+                o.t2_deadline_ms = v().parse().unwrap_or_else(|_| die("--tier2-deadline-ms"))
+            }
+            "--tier2-threshold" => {
+                o.t2_threshold = v().parse().unwrap_or_else(|_| die("--tier2-threshold"))
+            }
+            "--tier2-log" => o.t2_log = Some(v().into()),
+            "--tier2-allowlist" => o.t2_allowlist = Some(v().into()),
+            "--tier2-diag" => {
+                o.t2_diag = true;
+                i += 1;
+                continue;
+            }
             "--addr" => o.addr = v(),
             "--n" => o.n = v().parse().unwrap_or_else(|_| die("--n")),
             "--home" => {
@@ -139,6 +170,38 @@ fn engine(dir: &Path, o: &Opts) -> Engine {
         approval_sk: Some(ed_key(dir, "approval.key")),
     })
     .unwrap_or_else(|e| die(e))
+}
+
+/// Start the Tier 2 sidecar (one process = one scoring session) if `--tier2-scorer` is set.
+/// The model digest must be on the allowlist (pinned copy by default) or the Edge refuses to start.
+fn attach_tier2(e: &mut Engine, o: &Opts) {
+    use sentryra_sidecar_risk::{allowlist, client, rules};
+    let Some(dir) = &o.t2_scorer else { return };
+    let allow = match &o.t2_allowlist {
+        Some(p) => allowlist::parse(&read(p)),
+        None => allowlist::parse(allowlist::PINNED),
+    }
+    .unwrap_or_else(|e| die(format!("tier2 allowlist: {e:?}")));
+    let sock = std::env::temp_dir().join(format!("sentryra-t2-{}.sock", std::process::id()));
+    let c = client::Client::spawn(client::SpawnOpts {
+        python: o.t2_python.clone(),
+        server: client::default_server(),
+        scorer_dir: dir.clone(),
+        socket: sock,
+        allowlist: allow,
+        log: o.t2_log.clone(),
+        cfg: rules::Config {
+            threshold: o.t2_threshold,
+            near_margin: 0.03,
+            deadline_ms: o.t2_deadline_ms,
+        },
+    })
+    .unwrap_or_else(|e| die(format!("tier2: {}", e.0)));
+    eprintln!(
+        "[sentryra] tier2 scorer up: model sha256:{} deadline {} ms threshold {}",
+        c.model_digest, o.t2_deadline_ms, o.t2_threshold
+    );
+    e.set_tier2(Arc::new(c), o.t2_diag);
 }
 
 fn main() {
@@ -238,12 +301,20 @@ fn main() {
             }
             let mandate =
                 std::env::var("SENTRYRA_MANDATE").unwrap_or_else(|_| die("set SENTRYRA_MANDATE"));
-            let e = Arc::new(engine(&d, &o));
+            let mut e = engine(&d, &o);
+            attach_tier2(&mut e, &o);
+            let e = Arc::new(e);
             // Trusted host context for `$` bindings: from the host's environment, never from the agent.
             let context = std::env::var("SENTRYRA_CONTEXT").ok().map(|c| {
                 serde_json::from_str(&c).unwrap_or_else(|x| die(format!("SENTRYRA_CONTEXT: {x}")))
             });
-            std::process::exit(proxy::run(e, mandate, context, &o.rest));
+            let code = proxy::run(e.clone(), mandate, context, &o.rest);
+            if let Some(c) = e.tier2() {
+                c.flush(std::time::Duration::from_secs(120)); // per-window diagnostics, after the run
+                c.shutdown();
+            }
+            drop(e);
+            std::process::exit(code);
         }
         "bench" => {
             let d = need_dir();

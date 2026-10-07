@@ -24,6 +24,10 @@ pub struct ToolDef {
     /// against arguments by kind (e.g. `recipient_domains` applies to every `email` argument).
     #[serde(default)]
     pub args: std::collections::BTreeMap<String, ArgKind>,
+    /// Side-effect class from the signed catalogue (read | write | external_send | destructive |
+    /// privilege). Drives Tier 2 failure handling. Missing => derived from `consequential`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_effect_class: Option<String>,
 }
 
 /// Semantic kind of a tool argument.

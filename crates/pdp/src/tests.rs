@@ -501,3 +501,71 @@ fn signed_context_value_clears_sql_identifier() {
     ));
     assert_eq!(r.decision, "allow", "{:?}", r.reasons);
 }
+
+/// Engine + fake Tier 2 scorer (unix socket) that always answers score 1.0 / escalate.
+fn engine_with_fake_t2(delay_ms: u64) -> (Engine, String) {
+    use std::io::{BufRead, BufReader, Write};
+    let (mut e, t, _) = engine(Mode::Enforce);
+    let p = std::env::temp_dir().join(format!("pdp-t2-{}-{delay_ms}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&p);
+    let l = std::os::unix::net::UnixListener::bind(&p).unwrap();
+    std::thread::spawn(move || {
+        let (s, _) = l.accept().unwrap();
+        let mut w = s.try_clone().unwrap();
+        for line in BufReader::new(s).lines().map_while(Result::ok) {
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if v["op"] == "score" {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    serde_json::json!({"id": v["id"], "op": "score", "scored": true, "score": 1.0,
+                    "band": "high", "escalate": true, "reason_codes": ["T2_UNTRUSTED_CONTENT_CARRIED"], "windows_read": 1, "windows_total": 1})
+                );
+            }
+        }
+    });
+    let s = std::os::unix::net::UnixStream::connect(&p).unwrap();
+    let c =
+        sentryra_sidecar_risk::client::Client::from_stream(s, Default::default(), "x".into(), None)
+            .unwrap();
+    e.set_tier2(std::sync::Arc::new(c), false);
+    (e, t)
+}
+
+#[test]
+fn tier2_escalates_allow_but_never_lowers_deny() {
+    let (e, t) = engine_with_fake_t2(0);
+    let r = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "SELECT 1"}),
+    ));
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(r.policy_ids.contains(&"tier2-escalate".to_string()));
+    let r = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "DROP TABLE users"}),
+    ));
+    assert_eq!(r.decision, "deny", "{:?}", r.reasons);
+    // only score / band / codes are recorded from Tier 2
+    let t2 = r.reasons.iter().find(|x| x.starts_with("tier2:")).unwrap();
+    assert!(
+        t2.contains("\"score\":1.0") && t2.contains("T2_UNTRUSTED_CONTENT_CARRIED"),
+        "{t2}"
+    );
+}
+
+#[test]
+fn tier2_timeout_on_write_class_is_none_plus_log() {
+    // demo db.query is consequential => class write: a timeout logs T2_TIMEOUT, no effect
+    let (e, t) = engine_with_fake_t2(50);
+    let r = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "SELECT 1"}),
+    ));
+    assert_eq!(r.decision, "allow", "{:?}", r.reasons);
+    assert!(r.reasons.iter().any(|x| x.contains("T2_TIMEOUT")));
+}

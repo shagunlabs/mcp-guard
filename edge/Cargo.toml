@@ -11,6 +11,7 @@ sentryra-mandate = { path = "../crates/mandate" }
 sentryra-evidence = { path = "../crates/evidence" }
 sentryra-connector-manifest = { path = "../crates/connector-manifest" }
 sentryra-pdp = { path = "../crates/pdp" }
+sentryra-sidecar-risk = { path = "../sidecar-risk" }
 biscuit-auth = "6"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
