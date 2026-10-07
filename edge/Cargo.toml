@@ -3,7 +3,19 @@ name = "sentryra-edge"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+[[bin]]
+name = "sentryra-edge"
+path = "src/main.rs"
 [dependencies]
 sentryra-mandate = { path = "../crates/mandate" }
 sentryra-evidence = { path = "../crates/evidence" }
 sentryra-connector-manifest = { path = "../crates/connector-manifest" }
+sentryra-pdp = { path = "../crates/pdp" }
+biscuit-auth = "6"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+hex.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.8"

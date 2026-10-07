@@ -1,0 +1,18 @@
+[package]
+name = "sentryra-pdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+[dependencies]
+sentryra-mandate = { path = "../mandate" }
+sentryra-evidence = { path = "../evidence" }
+sentryra-connector-manifest = { path = "../connector-manifest" }
+biscuit-auth = "6"
+cedar-policy = "4"
+sqlparser = "0.58"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+rand = "0.8"

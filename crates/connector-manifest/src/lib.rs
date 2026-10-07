@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Trust { Trusted, Untrusted }
+pub enum Trust {
+    Trusted,
+    Untrusted,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDef {
@@ -18,7 +21,9 @@ pub struct ToolDef {
     #[serde(default)]
     pub sink_args: Vec<String>,
 }
-fn untrusted() -> Trust { Trust::Untrusted }
+fn untrusted() -> Trust {
+    Trust::Untrusted
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
@@ -29,15 +34,21 @@ pub struct Manifest {
 }
 
 impl Manifest {
-    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> { serde_json::from_str(s) }
-    pub fn tool(&self, name: &str) -> Option<&ToolDef> { self.tools.iter().find(|t| t.name == name) }
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(s)
+    }
+    pub fn tool(&self, name: &str) -> Option<&ToolDef> {
+        self.tools.iter().find(|t| t.name == name)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test] fn example_parses_and_defaults_untrusted() {
-        let m = Manifest::from_json(include_str!("../../../spec/examples/connector-github.json")).unwrap();
+    #[test]
+    fn example_parses_and_defaults_untrusted() {
+        let m = Manifest::from_json(include_str!("../../../spec/examples/connector-github.json"))
+            .unwrap();
         let t = m.tool("github.get_issue").unwrap();
         assert_eq!(t.output_trust, Trust::Untrusted);
         assert!(m.tool("github.merge_pull_request").unwrap().consequential);

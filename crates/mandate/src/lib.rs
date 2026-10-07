@@ -1,11 +1,16 @@
 //! Mandate v0 canonical JSON model (spec/mandate-v0.md). Biscuit compilation lands in M1.
 use serde::{Deserialize, Serialize};
+pub mod token;
 
 pub const SPEC_ID: &str = "sentryra.mandate/v0";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Effect { Allow, Escalate, Deny }
+pub enum Effect {
+    Allow,
+    Escalate,
+    Deny,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Scope {
@@ -33,7 +38,13 @@ pub struct Mandate {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum MandateError { WrongSpec, DefaultNotDeny, NoScopes, EscalateWithoutApprovers(usize), Parse(String) }
+pub enum MandateError {
+    WrongSpec,
+    DefaultNotDeny,
+    NoScopes,
+    EscalateWithoutApprovers(usize),
+    Parse(String),
+}
 
 impl Mandate {
     pub fn from_json(s: &str) -> Result<Self, MandateError> {
@@ -43,9 +54,15 @@ impl Mandate {
     }
     /// Structural invariants of v0 (signature checks are M1).
     pub fn validate(&self) -> Result<(), MandateError> {
-        if self.spec != SPEC_ID { return Err(MandateError::WrongSpec); }
-        if self.default_effect != Effect::Deny { return Err(MandateError::DefaultNotDeny); }
-        if self.scopes.is_empty() { return Err(MandateError::NoScopes); }
+        if self.spec != SPEC_ID {
+            return Err(MandateError::WrongSpec);
+        }
+        if self.default_effect != Effect::Deny {
+            return Err(MandateError::DefaultNotDeny);
+        }
+        if self.scopes.is_empty() {
+            return Err(MandateError::NoScopes);
+        }
         for (i, s) in self.scopes.iter().enumerate() {
             if s.effect == Effect::Escalate && s.approvers.is_empty() {
                 return Err(MandateError::EscalateWithoutApprovers(i));
@@ -55,8 +72,13 @@ impl Mandate {
     }
     /// Exact-match scope lookup; anything unmatched is the default (deny). Wildcards are M1+.
     pub fn effect_for(&self, tool: &str, resource: &str) -> Effect {
-        let rank = |e: Effect| match e { Effect::Allow => 0, Effect::Escalate => 1, Effect::Deny => 2 };
-        self.scopes.iter()
+        let rank = |e: Effect| match e {
+            Effect::Allow => 0,
+            Effect::Escalate => 1,
+            Effect::Deny => 2,
+        };
+        self.scopes
+            .iter()
             .filter(|s| s.tool == tool && s.resource == resource)
             .map(|s| s.effect)
             .max_by_key(|e| rank(*e)) // strictest wins: deny > escalate > allow
@@ -68,15 +90,35 @@ impl Mandate {
 mod tests {
     use super::*;
     const EX: &str = include_str!("../../../spec/examples/mandate-v0.json");
-    #[test] fn example_parses() { Mandate::from_json(EX).unwrap(); }
-    #[test] fn default_deny() {
-        let m = Mandate::from_json(EX).unwrap();
-        assert_eq!(m.effect_for("k8s.delete", "cluster:prod/ns:billing"), Effect::Deny);
-        assert_eq!(m.effect_for("k8s.apply", "cluster:staging/ns:billing"), Effect::Allow);
-        assert_eq!(m.effect_for("k8s.apply", "cluster:prod/ns:billing"), Effect::Escalate);
+    #[test]
+    fn example_parses() {
+        Mandate::from_json(EX).unwrap();
     }
-    #[test] fn rejects_default_allow() {
-        let bad = EX.replace("\"default_effect\": \"deny\"", "\"default_effect\": \"allow\"");
-        assert_eq!(Mandate::from_json(&bad).unwrap_err(), MandateError::DefaultNotDeny);
+    #[test]
+    fn default_deny() {
+        let m = Mandate::from_json(EX).unwrap();
+        assert_eq!(
+            m.effect_for("k8s.delete", "cluster:prod/ns:billing"),
+            Effect::Deny
+        );
+        assert_eq!(
+            m.effect_for("k8s.apply", "cluster:staging/ns:billing"),
+            Effect::Allow
+        );
+        assert_eq!(
+            m.effect_for("k8s.apply", "cluster:prod/ns:billing"),
+            Effect::Escalate
+        );
+    }
+    #[test]
+    fn rejects_default_allow() {
+        let bad = EX.replace(
+            "\"default_effect\": \"deny\"",
+            "\"default_effect\": \"allow\"",
+        );
+        assert_eq!(
+            Mandate::from_json(&bad).unwrap_err(),
+            MandateError::DefaultNotDeny
+        );
     }
 }

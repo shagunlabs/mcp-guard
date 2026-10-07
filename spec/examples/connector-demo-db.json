@@ -1,0 +1,3 @@
+{"spec":"sentryra.connector/v0","connector":"demo-db","version":"0.0.1","tools":[
+ {"name":"db.query","resource_template":"db:{db}","consequential":true,"output_trust":"untrusted","sink_args":["sql"]}
+]}
