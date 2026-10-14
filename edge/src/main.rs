@@ -27,6 +27,8 @@ opts: --mode shadow|enforce (default enforce) --catalogue <manifest.json> (repea
       --policies <file.cedar> (default: compiled-in) --evidence <file.jsonl> (default: <keydir>/evidence.jsonl; --no-evidence to disable) --revoked <id,...> --edge-url <url>
       --tier2-scorer <dir> [--tier2-deadline-ms 10] [--tier2-recheck-secs 60] [--tier2-diagnostic-no-probe (score-only diagnostics, never enforce)] [--tier2-dev-export (dev-export builds only; fixture mandates only)] [--tier2-config <scorer-config.json>] [--tier2-log <jsonl>]
       [--tier2-diag] [--tier2-allowlist <file>] [--tier2-python python3]   (mcp-proxy)
+      [--tier2-noamx-shim <noamx.so> (default: deploy/noamx/noamx.so, sha256-pinned; preloaded into the scorer, which must prove AMX off or Tier 2 is refused)]
+      [--tier2-diagnostic-allow-amx (dev-export builds only: no shim, accept XTILEDATA granted; AMX-on comparison, never enforce)]
       PROTOTYPE, off by default: [--tier2-window-filter (score only windows traceable to untrusted output; skipped windows = T2_PARTIAL_READ)] [--tier2-send-deadline-ms <ms> (external_send only; other classes keep --tier2-deadline-ms)]";
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -77,6 +79,8 @@ struct Opts {
     t2_diag: bool,
     t2_allowlist: Option<PathBuf>,
     t2_config: Option<PathBuf>,
+    t2_noamx_shim: Option<PathBuf>,
+    t2_diag_allow_amx: bool,
 }
 
 fn opts(args: &[String]) -> Opts {
@@ -100,6 +104,8 @@ fn opts(args: &[String]) -> Opts {
         t2_diag: false,
         t2_allowlist: None,
         t2_config: None,
+        t2_noamx_shim: None,
+        t2_diag_allow_amx: false,
         addr: "127.0.0.1:8787".into(),
         n: 20000,
         rest: vec![],
@@ -163,6 +169,15 @@ fn opts(args: &[String]) -> Opts {
                 )
             }
             "--tier2-config" => o.t2_config = Some(v().into()),
+            "--tier2-noamx-shim" => o.t2_noamx_shim = Some(v().into()),
+            "--tier2-diagnostic-allow-amx" => {
+                if !sentryra_sidecar_risk::client::Client::dev_export_compiled() {
+                    die("--tier2-diagnostic-allow-amx: dev-export builds only (release builds always require AMX off)");
+                }
+                o.t2_diag_allow_amx = true;
+                i += 1;
+                continue;
+            }
             "--tier2-log" => o.t2_log = Some(v().into()),
             "--tier2-allowlist" => o.t2_allowlist = Some(v().into()),
             "--tier2-diag" => {
@@ -274,6 +289,12 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
         scorer_config_path: cfg_path,
         diagnostic_no_probe: o.t2_diag_noprobe,
         feature_export: o.t2_dev_export,
+        noamx_shim: Some(
+            o.t2_noamx_shim
+                .clone()
+                .unwrap_or_else(client::default_noamx_shim),
+        ),
+        diagnostic_allow_amx: o.t2_diag_allow_amx,
     }) {
         Ok(c) => {
             eprintln!(

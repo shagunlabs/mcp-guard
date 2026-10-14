@@ -26,6 +26,10 @@ pub struct Client {
     untrusted: Mutex<HashSet<String>>,
     /// Set when a periodic probe re-check fails: Tier 2 is then unavailable (fail closed).
     pub health: Arc<Mutex<Option<String>>>,
+    /// DIAGNOSTIC ONLY (dev-export builds): the scorer may report XTILEDATA granted (AMX-on comparison).
+    allow_amx_diag: bool,
+    /// The scorer's startup AMX report (`hello.amx`), for logs and bench records.
+    pub amx: Option<Value>,
     next: AtomicU64,
     pub cfg: Config,
     pub model_digest: String,
@@ -56,6 +60,61 @@ pub struct SpawnOpts {
     pub diagnostic_no_probe: bool,
     /// DEV ONLY: allow per-call feature export (ignored unless built with `dev-export`).
     pub feature_export: bool,
+    /// AMX-off shim preloaded into the scorer (`LD_PRELOAD`); must match `NOAMX_SHA256`.
+    /// `None` is accepted only together with `diagnostic_allow_amx` in a dev-export build.
+    pub noamx_shim: Option<PathBuf>,
+    /// DIAGNOSTIC ONLY, dev-export builds only: run the scorer WITHOUT the shim and accept a report of
+    /// XTILEDATA granted (AMX-on load comparison). Config id gets `+diag-amx`; never enforcement.
+    pub diagnostic_allow_amx: bool,
+}
+
+/// Pinned sha256 of the AMX-off shim built by `deploy/noamx/build.sh` (reproducible; equals the research
+/// `tier2-prototype/concurrency/noamx.so`, built from the vendored `deploy/noamx/noamx.c`).
+pub const NOAMX_PIN_FILE: &str = include_str!("../../deploy/noamx/noamx.so.sha256");
+
+pub fn noamx_sha256() -> &'static str {
+    NOAMX_PIN_FILE.split_whitespace().next().unwrap_or("")
+}
+
+/// Default shim location (built in place by `make noamx`).
+pub fn default_noamx_shim() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/noamx/noamx.so")
+}
+
+/// Check the shim file against its pin and return its absolute path (for `LD_PRELOAD`).
+pub fn verify_noamx_shim(p: &Path, pin: &str) -> Result<PathBuf, ClientError> {
+    let got = allowlist::sha256_file(p).map_err(|e| {
+        ClientError(format!(
+            "noamx shim {}: {e:?} (build it: make noamx)",
+            p.display()
+        ))
+    })?;
+    if got != pin {
+        return Err(ClientError(format!(
+            "noamx shim {} sha256 {got} != pinned {pin}; refusing Tier 2",
+            p.display()
+        )));
+    }
+    std::fs::canonicalize(p).map_err(|e| ClientError(format!("noamx shim: {e}")))
+}
+
+/// The scorer must prove AMX is off: its `amx.xtiledata_granted` (raw ARCH_GET_XCOMP_PERM bit 18,
+/// read after model load) must be exactly `false`. Missing / null / true => refuse Tier 2, except
+/// `true` under the dev-only AMX diagnostic. "Shim loaded" alone is never accepted as proof.
+pub fn check_amx(reply: &Value, allow_amx_diag: bool) -> Result<(), ClientError> {
+    match reply
+        .get("amx")
+        .and_then(|a| a.get("xtiledata_granted"))
+        .and_then(|v| v.as_bool())
+    {
+        Some(false) => Ok(()),
+        Some(true) if allow_amx_diag => Ok(()),
+        g => Err(ClientError(format!(
+            "scorer AMX check: xtiledata_granted={} (must be false; AMX INT8 is not deterministic under load): {}",
+            g.map(|b| b.to_string()).unwrap_or_else(|| "unknown".into()),
+            reply.get("amx").cloned().unwrap_or_default()
+        ))),
+    }
 }
 
 impl Client {
@@ -84,8 +143,28 @@ impl Client {
                 )));
             }
         }
+        let diag_amx = o.diagnostic_allow_amx && Self::dev_export_compiled();
+        if o.diagnostic_allow_amx && !diag_amx {
+            return Err(ClientError(
+                "diagnostic_allow_amx needs a dev-export build".into(),
+            ));
+        }
+        let shim = match (&o.noamx_shim, diag_amx) {
+            (_, true) => None, // AMX-on diagnostic: no shim at all
+            (Some(p), false) => Some(verify_noamx_shim(p, noamx_sha256())?),
+            (None, false) => {
+                return Err(ClientError(
+                    "Tier 2 needs the noamx shim (AMX off); none configured".into(),
+                ))
+            }
+        };
         let _ = std::fs::remove_file(&o.socket);
-        let mut child = Command::new(&o.python)
+        let mut cmd = Command::new(&o.python);
+        match &shim {
+            Some(p) => cmd.env("LD_PRELOAD", p), // exactly the pinned shim; nothing inherited
+            None => cmd.env_remove("LD_PRELOAD"),
+        };
+        let mut child = cmd
             .arg(&o.server)
             .arg("--scorer-dir")
             .arg(&o.scorer_dir)
@@ -107,6 +186,11 @@ impl Client {
             })
             .args(if o.feature_export && Self::dev_export_compiled() {
                 vec!["--feature-export"]
+            } else {
+                vec![]
+            })
+            .args(if diag_amx {
+                vec!["--diagnostic-allow-amx"]
             } else {
                 vec![]
             })
@@ -138,6 +222,10 @@ impl Client {
         if o.diagnostic_no_probe {
             c.config_version.push_str("+diag-noprobe");
         }
+        if diag_amx {
+            c.config_version.push_str("+diag-amx");
+        }
+        c.allow_amx_diag = diag_amx;
         *c.child.lock().unwrap() = Some(child);
         let hello = c
             .call(json!({"op": "hello"}), Duration::from_secs(60))
@@ -151,6 +239,13 @@ impl Client {
                 "scorer digest {got} != allowlisted {digest}"
             )));
         }
+        // AMX proof before anything else is trusted (the scorer also refuses on its own).
+        check_amx(&hello, diag_amx)?;
+        c.amx = hello.get("amx").cloned();
+        eprintln!(
+            "[sentryra] tier2 AMX check passed: {}",
+            hello.get("amx").cloned().unwrap_or_default()
+        );
         if hello.get("config_version").and_then(|v| v.as_str()) != Some(c.config_version.as_str()) {
             return Err(ClientError(format!(
                 "scorer config {:?} != {}",
@@ -239,6 +334,8 @@ impl Client {
             pending_ingest: pending,
             untrusted: Mutex::default(),
             health: Arc::default(),
+            allow_amx_diag: false,
+            amx: None,
             next: AtomicU64::new(1),
             cfg,
             model_digest,
@@ -257,6 +354,8 @@ impl Client {
             pending_ingest: Arc::default(),
             untrusted: Mutex::default(),
             health: Arc::default(),
+            allow_amx_diag: false,
+            amx: None,
             next: AtomicU64::new(1),
             cfg,
             model_digest: String::new(),
@@ -329,17 +428,22 @@ impl Client {
             return false;
         }
         let r = self.call(json!({"op": "probe"}), timeout);
+        let amx = r.as_ref().map(|v| check_amx(v, self.allow_amx_diag));
         let ok = r
             .as_ref()
             .and_then(|v| v.get("determinism_ok"))
             .and_then(|v| v.as_bool())
-            == Some(true);
+            == Some(true)
+            && matches!(amx, Some(Ok(())));
         if !ok {
-            let why = format!(
-                "periodic probe re-check failed: {}",
-                r.and_then(|v| v.get("determinism").cloned())
-                    .unwrap_or(json!("no reply"))
-            );
+            let why = match amx {
+                Some(Err(e)) => format!("periodic re-check: {}", e.0),
+                _ => format!(
+                    "periodic probe re-check failed: {}",
+                    r.and_then(|v| v.get("determinism").cloned())
+                        .unwrap_or(json!("no reply"))
+                ),
+            };
             eprintln!("[sentryra] tier2 UNAVAILABLE (fail closed): {why}");
             *self.health.lock().unwrap() = Some(why);
         } else {
@@ -560,7 +664,7 @@ mod t {
                         let _ = writeln!(
                             w,
                             "{}",
-                            json!({"id": v["id"], "op": "probe", "determinism_ok": probe_ok, "determinism": "fake"})
+                            json!({"id": v["id"], "op": "probe", "determinism_ok": probe_ok, "determinism": "fake", "amx": {"xtiledata_granted": false}})
                         );
                     }
                     _ => {}
@@ -846,5 +950,97 @@ mod export_t {
         } else {
             assert_eq!(got, None, "release/default builds never request an export");
         }
+    }
+}
+
+#[cfg(test)]
+mod amx_t {
+    use super::*;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn amx_must_be_proven_off() {
+        let r = |a: Value| json!({ "amx": a });
+        assert!(check_amx(&r(json!({"xtiledata_granted": false})), false).is_ok());
+        for bad in [
+            json!({"xtiledata_granted": true}),
+            json!({"xtiledata_granted": null}),
+            json!({"xtiledata_granted": "false"}),
+            json!({"shim_mapped": true}), // "shim loaded" is not proof
+            json!(null),
+        ] {
+            assert!(check_amx(&r(bad.clone()), false).is_err(), "{bad}");
+        }
+        assert!(check_amx(&json!({}), false).is_err(), "no amx report");
+        // dev-only AMX-on diagnostic accepts `true`, still never unknown
+        assert!(check_amx(&r(json!({"xtiledata_granted": true})), true).is_ok());
+        assert!(check_amx(&r(json!({"xtiledata_granted": null})), true).is_err());
+    }
+
+    #[test]
+    fn shim_pinned_by_sha256() {
+        assert_eq!(
+            noamx_sha256(),
+            "2634166910b2503f7d3e6fd354fcf9607a3b4ddfde119d8840a40c8b4d97d205"
+        );
+        let d = std::env::temp_dir().join(format!("noamx-t-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("noamx.so");
+        std::fs::write(&f, b"not the shim").unwrap();
+        let sha = allowlist::sha256_file(&f).unwrap();
+        assert!(verify_noamx_shim(&f, noamx_sha256()).is_err(), "unpinned file refused");
+        let ok = verify_noamx_shim(&f, &sha).unwrap();
+        assert!(ok.is_absolute());
+        assert!(verify_noamx_shim(&d.join("missing.so"), &sha).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+        // The in-tree build (make noamx) must match the pin when present.
+        let real = default_noamx_shim();
+        if real.exists() {
+            verify_noamx_shim(&real, noamx_sha256()).unwrap();
+        } else {
+            eprintln!("note: {} not built (make noamx); pin check of the real shim skipped", real.display());
+        }
+    }
+
+    fn fake_amx(probe_amx: Value) -> Client {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "t2amx{}-{}.sock",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&p);
+        let l = UnixListener::bind(&p).unwrap();
+        std::thread::spawn(move || {
+            let (s, _) = l.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            for line in BufReader::new(s).lines().map_while(Result::ok) {
+                let v: Value = serde_json::from_str(&line).unwrap();
+                let _ = writeln!(
+                    w,
+                    "{}",
+                    json!({"id": v["id"], "op": "probe", "determinism_ok": true, "determinism": "fake", "amx": probe_amx})
+                );
+            }
+        });
+        Client::from_stream(
+            UnixStream::connect(&p).unwrap(),
+            Config::default(),
+            "x".into(),
+            None,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn periodic_recheck_fails_closed_if_amx_appears() {
+        let c = fake_amx(json!({"xtiledata_granted": true}));
+        assert!(!c.recheck(Duration::from_secs(2)), "probes pass but AMX granted");
+        assert!(c.unavailable().unwrap().contains("xtiledata_granted=true"));
+        let c = fake_amx(json!({"shim_mapped": true}));
+        assert!(!c.recheck(Duration::from_secs(2)), "no proof");
+        let c = fake_amx(json!({"xtiledata_granted": false}));
+        assert!(c.recheck(Duration::from_secs(2)));
+        assert!(c.unavailable().is_none());
     }
 }

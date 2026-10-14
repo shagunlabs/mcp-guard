@@ -1,5 +1,7 @@
 demo:
 	./demo/run.sh
-test:
+noamx:
+	./deploy/noamx/build.sh
+test: noamx
 	cargo test --workspace
-.PHONY: demo test
+.PHONY: demo test noamx

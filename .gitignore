@@ -4,3 +4,5 @@ target/
 demo/.run/
 /dist/
 __pycache__/
+/deploy/noamx/noamx.so
+/deploy/noamx/noamx.so.tmp

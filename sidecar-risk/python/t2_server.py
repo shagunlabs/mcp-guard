@@ -19,6 +19,7 @@ ap.add_argument("--config", required=True, help="versioned scorer config (scorer
 ap.add_argument("--feature-export", action="store_true", help="DEV/HELDOUT: include full feature export in diag flush")
 ap.add_argument("--window-filter", action="store_true", help="PROTOTYPE: score only windows traceable to untrusted output; skipped windows are reported (windows_skipped) and count as unread")
 ap.add_argument("--diagnostic-no-probe", action="store_true", help="DIAGNOSTIC ONLY: skip the probe check (score-only pass)")
+ap.add_argument("--diagnostic-allow-amx", action="store_true", help="DIAGNOSTIC ONLY (AMX-on load comparison): report XTILEDATA but do not refuse; config id gets +diag-amx")
 a = ap.parse_args()
 sys.path.insert(0, a.scorer_dir)
 import scorer  # noqa: E402  (the research single entrypoint)
@@ -43,7 +44,52 @@ if CFG.get("weights_file"):
     W = json.load(open(wpath))
 THR = float(CFG["threshold"])
 EXPORT = a.feature_export   # only passed by an Edge built with the dev-export feature
-CFG_ID = CFG["config_version"] + ("+diag-noprobe" if a.diagnostic_no_probe else "")
+CFG_ID = CFG["config_version"] + ("+diag-noprobe" if a.diagnostic_no_probe else "") + ("+diag-amx" if a.diagnostic_allow_amx else "")
+
+# --- AMX proof (the research hardening) -------------------------------------------------------------------
+# The noamx.so shim (LD_PRELOAD, set by the Edge) is NOT proof that AMX is off: it only interposes libc
+# syscall(), so an inline-asm request or a missing/ignored preload would slip through. The proof is the
+# kernel's own answer: after the model is loaded and has run, arch_prctl(ARCH_GET_XCOMP_PERM) must not
+# contain XTILEDATA (bit 18). The call goes through libc's OWN syscall() (dlsym on the libc handle), so
+# the shim, which answers EPERM for exactly this request, cannot hide the real mask from us.
+ARCH_GET_XCOMP_PERM, XFEATURE_XTILEDATA, SYS_arch_prctl_x86_64 = 0x1022, 18, 158
+
+
+def amx_status():
+    import ctypes, errno, platform
+    st = {"arch": platform.machine(), "ld_preload": os.environ.get("LD_PRELOAD"),
+          "shim_mapped": any("noamx" in l for l in open("/proc/self/maps")),
+          "cpu_amx_tile": None, "xcomp_perm": None, "xtiledata_granted": None}
+    try:
+        flags = next((l.split(":", 1)[1].split() for l in open("/proc/cpuinfo") if l.startswith("flags")), [])
+        st["cpu_amx_tile"] = "amx_tile" in flags
+    except OSError:
+        pass
+    if st["arch"] != "x86_64":
+        st.update(xtiledata_granted=False, method="non-x86_64: no AMX")
+        return st
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)   # libc's own syscall(), not the interposed one
+    mask = ctypes.c_uint64(0)
+    rc = libc.syscall(ctypes.c_long(SYS_arch_prctl_x86_64), ctypes.c_long(ARCH_GET_XCOMP_PERM), ctypes.byref(mask))
+    err = ctypes.get_errno()
+    if rc == 0:
+        st.update(method="arch_prctl(ARCH_GET_XCOMP_PERM) via libc.so.6 syscall", xcomp_perm=hex(mask.value),
+                  xtiledata_granted=bool(mask.value >> XFEATURE_XTILEDATA & 1))
+    elif err == errno.EINVAL:   # kernel without dynamic XSTATE permissions (< 5.16): AMX unusable in user space
+        st.update(method="ARCH_GET_XCOMP_PERM unsupported (EINVAL)", xtiledata_granted=False)
+    else:                       # anything else: unknown => treated as granted by the Edge (fail closed)
+        st.update(method=f"ARCH_GET_XCOMP_PERM failed errno={err}", xtiledata_granted=None)
+    # Is the shim actually interposing? (informational: the interposed syscall() answers EPERM)
+    try:
+        r2 = ctypes.CDLL(None, use_errno=True).syscall(ctypes.c_long(SYS_arch_prctl_x86_64), ctypes.c_long(ARCH_GET_XCOMP_PERM), ctypes.byref(ctypes.c_uint64(0)))
+        st["shim_interposing"] = r2 == -1 and ctypes.get_errno() == errno.EPERM
+    except Exception:
+        st["shim_interposing"] = None
+    return st
+
+
+def amx_ok(st):
+    return st.get("xtiledata_granted") is False or (a.diagnostic_allow_amx and st.get("xtiledata_granted") is True)
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -63,6 +109,10 @@ def selected(ws, untrusted, purpose):
 ENC = scorer.Encoder(model)                          # the one and only INT8 session
 for _ in range(5):                                   # warm-up before accepting (stateless: no session data)
     ENC.one("warm-up text for the tier two scorer session " * 8)
+AMX = amx_status()                                   # after model load + inference: the kernel's answer
+print(f"t2_server: amx {json.dumps(AMX)}", file=sys.stderr, flush=True)
+if not amx_ok(AMX):
+    sys.exit(f"t2_server: XTILEDATA (AMX) permission granted={AMX['xtiledata_granted']} after model load; refusing to start (Edge fails closed)")
 
 # Startup self-check against PINNED reference scores (the research probe file, incl. a long probe).
 # Each probe is scored in a fresh session on the one INT8 session; |score - reference| must be
@@ -100,7 +150,11 @@ def self_check():
         ok &= good
         out.append({"id": pr.get("id"), "ref": pr["ref_score"], "got": got, "ok": good,
                     "windows": None if r is None else f"{r['windows_read']}/{r['windows_total']}"})
-    return ok, {"reference": CFG["probe_reference_file"], "config_version": ref.get("config_version"), "tolerance": tol, "probes": out}
+    global AMX
+    AMX = amx_status()                               # again after the probe inferences
+    ok &= amx_ok(AMX)
+    return ok, {"reference": CFG["probe_reference_file"], "config_version": ref.get("config_version"), "tolerance": tol, "probes": out,
+                "xtiledata_granted": AMX["xtiledata_granted"]}
 
 
 if a.diagnostic_no_probe:
@@ -175,13 +229,15 @@ def handle(m):
     op = m.get("op")
     if op == "hello":
         return {"id": m["id"], "op": "hello", "model_digest": scorer.MODEL_DIGEST, "model_version": scorer.MODEL_VERSION, "model_id": scorer.MODEL_ID,
-                "config_version": CFG_ID, "window_filter": bool(a.window_filter), "determinism_ok": DET_OK, "determinism": DET}
+                "config_version": CFG_ID, "window_filter": bool(a.window_filter), "determinism_ok": DET_OK, "determinism": DET,
+                "amx": AMX}
     if op == "probe" and a.diagnostic_no_probe:
-        return {"id": m["id"], "op": "probe", "determinism_ok": True, "determinism": DET}
+        st = amx_status()
+        return {"id": m["id"], "op": "probe", "determinism_ok": amx_ok(st), "determinism": DET, "amx": st}
     if op == "probe":   # periodic re-check, queued FIFO behind scoring on the one INT8 session
         ok, det = self_check()
-        print(f"t2_server: periodic probe re-check {'PASS' if ok else 'FAIL'}", file=sys.stderr, flush=True)
-        return {"id": m["id"], "op": "probe", "determinism_ok": ok, "determinism": det}
+        print(f"t2_server: periodic probe re-check {'PASS' if ok else 'FAIL'} {json.dumps(det)}", file=sys.stderr, flush=True)
+        return {"id": m["id"], "op": "probe", "determinism_ok": ok, "determinism": det, "amx": AMX}
     if op == "ingest":
         session(m["session"]).ingest(m["text"])
         return {"ack": m["id"], "session": m["session"]}
