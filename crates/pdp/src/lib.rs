@@ -21,6 +21,7 @@ pub enum IngestError {
 
 pub mod bindings;
 pub mod constraints;
+pub mod long_send;
 pub mod receipts;
 pub mod sql;
 pub mod taint;
@@ -627,6 +628,31 @@ impl Engine {
             reasons.push("no permit matched (default deny)".into());
         }
 
+        // LONG_SEND_HOLD (Tier 1, deterministic, no model; independent of Tier 2 and of speed): an
+        // outbound send in a session that has seen untrusted tool output, whose text could take
+        // more than one Tier 2 window, escalates. Recorded alongside every other reason; never
+        // lowers a deny. A session has seen untrusted output iff `ingest_keyed` created its taint
+        // store entry (any untrusted output, even one with no taintable content).
+        if def.is_some_and(|d| {
+            t2::types::SideEffect::parse(d.side_effect_class.as_deref())
+                == t2::types::SideEffect::ExternalSend
+        }) && self.state.lock().unwrap().taint.contains_key(&skey)
+        {
+            let n = long_send::outbound_tokens(&req.args, def);
+            if long_send::is_long(n) {
+                reasons.push(format!(
+                    "{}: outbound_send after untrusted tool output in this session; outbound text token bound {n} > {} (one Tier 2 window): held for approval (Tier 1, deterministic){}",
+                    long_send::REASON_CODE,
+                    long_send::T2_WINDOW_TOKENS,
+                    if decision == "deny" { " (decision stays deny)" } else { "" }
+                ));
+                if decision != "deny" {
+                    decision = "escalate".into();
+                    policy_ids.push(long_send::POLICY_ID.into());
+                }
+            }
+        }
+
         // Tier 2 (escalate-only): may raise allow -> escalate; never lowers, never allows.
         if let Some((c, diag)) = &self.tier2 {
             let class = t2::types::SideEffect::parse(match def {
@@ -869,3 +895,5 @@ impl Engine {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_long_send;
