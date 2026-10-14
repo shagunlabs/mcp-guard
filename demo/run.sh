@@ -78,19 +78,10 @@ cat > "$R/support-catalogue.json" <<'J'
  {"name":"mail.send","resource_template":"mail","consequential":true,"output_trust":"trusted","sink_args":["to"],"side_effect_class":"external_send","args":{"to":"email","body":"text"}}]}
 J
 $EDGE sign-catalogue "$R/keys" "$R/support-catalogue.json" >/dev/null
-cat > "$R/support-spec.yaml" <<'Y'
-tenant: org_demo
-principal: priya@acme.example
-agent: agt_support
-purpose: Reply to the customer who opened the ticket
-ttl: 1h
-context:
-  ticket.requester: asha@cust.example
-tools:
-  - tool: ticket.read
-  - tool: mail.send
-Y
-SUP=$($EDGE mandate new "$R/keys" "$R/support-spec.yaml" --catalogue "$R/support-catalogue.json")
+cat > "$R/support-spec.json" <<'J'
+{"tenant":"org_demo","principal":"priya@acme.example","agent":"agt_support","purpose":"Reply to the customer who opened the ticket","ttl":"1h","context":{"ticket.requester":"asha@cust.example"},"tools":[{"tool":"ticket.read"},{"tool":"mail.send"}]}
+J
+SUP=$($EDGE mandate new "$R/keys" "$R/support-spec.json" --catalogue "$R/support-catalogue.json")
 $EDGE serve "$R/keys" --mode enforce --catalogue "$R/support-catalogue.json" --addr 127.0.0.1:18789 --no-evidence 2>"$R/serve3.log" &
 SP=$!; trap 'kill $SP 2>/dev/null || true' EXIT
 for i in $(seq 50); do curl -sf -o /dev/null http://127.0.0.1:18789/healthz && break; sleep 0.1; done

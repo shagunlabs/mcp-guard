@@ -1,4 +1,4 @@
-//! `sentryra-edge mandate new` end to end: build + sign from YAML/JSON specs, then decide through
+//! `sentryra-edge mandate new` end to end: build + sign from JSON specs, then decide through
 //! `serve`. Default recipients bind to the signed `ticket.requester`; explicit lists override; the
 //! `recipients: escalate` opt-out holds every send. Context values never appear on stdout/stderr.
 use std::io::{Read, Write};
@@ -75,15 +75,33 @@ fn build(keys: &Path, cat: &Path, spec: &Path) -> String {
     out.trim().to_string()
 }
 
-fn yaml(recipients: &str) -> String {
-    format!("tenant: t\nprincipal: p@acme.example\nagent: support-bot\npurpose: Reply to the customer\nttl: 1h\ncontext:\n  ticket.requester: {SECRET}\ntools:\n  - tool: ticket.read\n  - tool: mail.send\n{recipients}")
+fn json_spec(extra_mail: serde_json::Value) -> String {
+    let mut mail = serde_json::json!({"tool": "mail.send"});
+    if let Some(obj) = extra_mail.as_object() {
+        for (k, v) in obj {
+            mail[k] = v.clone();
+        }
+    }
+    serde_json::json!({
+        "tenant": "t",
+        "principal": "p@acme.example",
+        "agent": "support-bot",
+        "purpose": "Reply to the customer",
+        "ttl": "1h",
+        "context": {"ticket.requester": SECRET},
+        "tools": [
+            {"tool": "ticket.read"},
+            mail
+        ]
+    })
+    .to_string()
 }
 
 #[test]
 fn mandate_new_recipients_end_to_end() {
     let (d, keys, cat) = setup("e2e");
-    let s_default = d.join("default.yaml");
-    std::fs::write(&s_default, yaml("")).unwrap();
+    let s_default = d.join("default.json");
+    std::fs::write(&s_default, json_spec(serde_json::json!({}))).unwrap();
     let s_explicit = d.join("explicit.json");
     std::fs::write(
         &s_explicit,
@@ -93,10 +111,12 @@ fn mandate_new_recipients_end_to_end() {
         .to_string(),
     )
     .unwrap();
-    let s_opt = d.join("optout.yml");
+    let s_opt = d.join("optout.json");
     std::fs::write(
         &s_opt,
-        yaml("    recipients: escalate\n    approvers: [lead@acme.example]\n"),
+        json_spec(
+            serde_json::json!({"recipients": "escalate", "approvers": ["lead@acme.example"]}),
+        ),
     )
     .unwrap();
     let t_default = build(&keys, &cat, &s_default);
@@ -146,8 +166,8 @@ fn mandate_new_recipients_end_to_end() {
 #[test]
 fn mandate_new_rejects_bad_input_without_leaking() {
     let (d, keys, cat) = setup("bad");
-    let s = d.join("bad.yaml");
-    std::fs::write(&s, yaml("    recipients: escalate\n")).unwrap(); // no approvers
+    let s = d.join("bad.json");
+    std::fs::write(&s, json_spec(serde_json::json!({"recipients": "escalate"}))).unwrap(); // no approvers
     let (ok, out, err) = run(&[
         "mandate",
         "new",
@@ -160,7 +180,7 @@ fn mandate_new_rejects_bad_input_without_leaking() {
     assert!(!err.contains(SECRET));
     // unsigned catalogue is refused
     std::fs::write(format!("{}.sig", cat.display()), "00".repeat(64)).unwrap();
-    std::fs::write(&s, yaml("")).unwrap();
+    std::fs::write(&s, json_spec(serde_json::json!({}))).unwrap();
     let (ok, _, err) = run(&[
         "mandate",
         "new",

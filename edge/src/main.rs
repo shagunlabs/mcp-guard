@@ -16,10 +16,10 @@ const USAGE: &str = "usage: sentryra-edge <command>
   keygen <keydir>                               create local demo keys (root, catalogue, evidence, salt)
   sign-catalogue <keydir> <manifest.json>       write <manifest.json>.sig
   issue <keydir> <mandate.json>                 print a signed Biscuit mandate (base64)
-  mandate new <keydir> <spec.yaml|json> [--catalogue m.json] [--json-out f]
-                                                build + sign a mandate from a small spec, print the token
+  mandate new <keydir> <spec.json> [--catalogue m.json] [--json-out f]
+                                                build + sign a mandate from a small JSON spec, print the token
                                                 (external_send tools default to mail.recipients [$ticket.requester]
-                                                when the spec signs ticket.requester; context values are never printed)
+                                                when the spec has ticket.requester; context values are never printed)
   attenuate <keydir> <token> <tool> <resource> [expires_at]
   revocation-ids <keydir> <token>
   serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, GET /v1/evidence
@@ -319,7 +319,7 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
 }
 
 fn mandate_cmd(a: &[String]) {
-    const U: &str = "usage: sentryra-edge mandate new <keydir> <spec.yaml|spec.json> [--catalogue <manifest.json>] [--json-out <file>]";
+    const U: &str = "usage: sentryra-edge mandate new <keydir> <spec.json> [--catalogue <manifest.json>] [--json-out <file>]";
     let (Some(sub), Some(d), Some(spec_p)) = (a.first(), a.get(1), a.get(2)) else {
         die(U)
     };
@@ -360,8 +360,12 @@ fn mandate_cmd(a: &[String]) {
             }
         }
     }
-    let yaml = spec_p.ends_with(".yaml") || spec_p.ends_with(".yml");
-    let spec = mandate_new::parse_spec(&read(spec_p), yaml).unwrap_or_else(|e| die(e));
+    if !(spec_p.ends_with(".json")) {
+        die(format!(
+            "mandate new: spec must be JSON (.json), got {spec_p}"
+        ));
+    }
+    let spec = mandate_new::parse_spec(&read(spec_p)).unwrap_or_else(|e| die(e));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

@@ -51,25 +51,29 @@ In a container entrypoint or a Kubernetes initContainer, run `doctor` first and 
 
     sentryra-edge keygen /keys                   # root, catalogue, evidence, approval keys + approver.token + ingest.token
     sentryra-edge sign-catalogue /keys catalogue.json
-    sentryra-edge mandate new /keys spec.yaml --catalogue catalogue.json   # signed mandate from a small spec
+    sentryra-edge mandate new /keys spec.json --catalogue catalogue.json   # signed mandate from a small JSON spec
     sentryra-edge issue /keys mandate.json       # or: sign a full mandate JSON
 
 #### Building a mandate from a spec (`mandate new`)
-`sentryra-edge mandate new <keydir> <spec.yaml|spec.json> [--catalogue m.json] [--json-out f]` builds and signs a mandate and prints the token. Every scope gets default-deny around it, and `not_before`/`expires_at` come from `ttl` (default `8h`, max `30d`).
+`sentryra-edge mandate new <keydir> <spec.json> [--catalogue m.json] [--json-out f]` builds and signs a mandate from a JSON spec and prints the token. Every scope gets default-deny around it, and `not_before`/`expires_at` come from `ttl` (default `8h`, max `30d`).
 
-    tenant: org_acme
-    principal: priya@acme.example
-    agent: support-bot
-    purpose: Answer support tickets
-    ttl: 8h
-    context:
-      ticket.requester: customer@cust.example   # signed into the mandate
-    tools:
-      - tool: ticket.read
-      - tool: mail.send          # external_send in the signed catalogue (or set `class: external_send`)
+    {
+      "tenant": "org_acme",
+      "principal": "priya@acme.example",
+      "agent": "support-bot",
+      "purpose": "Answer support tickets",
+      "ttl": "8h",
+      "context": {
+        "ticket.requester": "customer@cust.example"
+      },
+      "tools": [
+        {"tool": "ticket.read"},
+        {"tool": "mail.send"}
+      ]
+    }
 
 Recipients for `external_send` tools:
-- **Default:** if the spec signs a `ticket.requester` context field, every `external_send` scope with no recipient rule gets `mail.recipients: ["$ticket.requester"]`, so the agent can only reply to the person who opened the ticket.
+- **Default:** if the spec has a `ticket.requester` context field, every `external_send` scope with no recipient rule gets `mail.recipients: ["$ticket.requester"]`. Sends to other addresses are denied or escalated per the rules.
 - **Override:** `recipients: [ops@acme.example, ...]` sets an explicit allowlist, and a `mail.recipients` or `mail.recipient_domains` constraint is kept as written.
 - **Opt-out:** `recipients: escalate` (needs `approvers`) holds every send through that scope for approval.
 

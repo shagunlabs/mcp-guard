@@ -1,11 +1,12 @@
-//! `sentryra-edge mandate new`: build a signed mandate from a small YAML/JSON spec.
+//! `sentryra-edge mandate new`: build a signed mandate from a small JSON spec.
 //!
-//! Recipient default: when the spec signs a `ticket.requester` context field, every
+//! Recipient default: when the spec has a `ticket.requester` context field, every
 //! `external_send` tool scope without its own recipient rule gets
 //! `mail.recipients: ["$ticket.requester"]` (resolved by the Edge from the signed context).
-//! Override per tool with `recipients: [..]` (explicit allowlist) or `recipients: escalate`
-//! (opt-out: every send through that scope is held for approval). Context VALUES are never
-//! printed or logged; summaries name context keys only.
+//! Sends to other addresses are denied or escalated per the rules. Override per tool with
+//! `recipients: [..]` (explicit allowlist) or `recipients: escalate` (opt-out: every send
+//! through that scope is held for approval). Context VALUES are never printed or logged;
+//! summaries name context keys only.
 use sentryra_mandate::{Effect, Mandate, Scope, SPEC_ID};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
@@ -81,12 +82,8 @@ pub enum RecipientRule {
     None,
 }
 
-pub fn parse_spec(text: &str, is_yaml: bool) -> Result<Spec, String> {
-    if is_yaml {
-        serde_yaml::from_str(text).map_err(|e| format!("spec: {}", redact(&e.to_string())))
-    } else {
-        serde_json::from_str(text).map_err(|e| format!("spec: {}", redact(&e.to_string())))
-    }
+pub fn parse_spec(text: &str) -> Result<Spec, String> {
+    serde_json::from_str(text).map_err(|e| format!("spec: {}", redact(&e.to_string())))
 }
 
 /// Parser messages can quote input; keep only the position/kind, never spec values.
@@ -320,7 +317,7 @@ mod tests {
             r#"{{"tenant":"t","principal":"p@x","agent":"a","purpose":"reply","context":{ctx},
             "tools":[{{"tool":"ticket.read"}},{extra_tool}]}}"#
         );
-        parse_spec(&t, false).unwrap()
+        parse_spec(&t).unwrap()
     }
     fn send_scope(m: &Mandate) -> &Scope {
         m.scopes.iter().find(|s| s.tool == "mail.send").unwrap()
@@ -455,7 +452,7 @@ mod tests {
             REQ
         )
         .contains("not both"));
-        assert!(parse_spec(r#"{"tenant":"t","bogus":1}"#, false).is_err());
+        assert!(parse_spec(r#"{"tenant":"t","bogus":1}"#).is_err());
     }
     #[test]
     fn times_and_ttl() {
@@ -468,9 +465,9 @@ mod tests {
         assert!(ttl_secs("31d").is_err() && ttl_secs("x").is_err() && ttl_secs("0h").is_err());
     }
     #[test]
-    fn yaml_spec_and_summary_never_has_context_values() {
-        let y = "tenant: t\nprincipal: p@x\nagent: a\npurpose: reply\ncontext:\n  ticket.requester: secret-req@cust.example\n  session: {user: hidden-user}\ntools:\n  - tool: mail.send\n    class: external_send\n";
-        let (m, r) = build(parse_spec(y, true).unwrap(), &BTreeMap::new(), NOW).unwrap();
+    fn json_spec_and_summary_never_has_context_values() {
+        let j = r#"{"tenant":"t","principal":"p@x","agent":"a","purpose":"reply","context":{"ticket.requester":"secret-req@cust.example","session":{"user":"hidden-user"}},"tools":[{"tool":"mail.send","class":"external_send"}]}"#;
+        let (m, r) = build(parse_spec(j).unwrap(), &BTreeMap::new(), NOW).unwrap();
         let s = summary(&m, &r);
         assert!(
             s.contains("ticket.requester") && s.contains("session.user"),
@@ -486,13 +483,6 @@ mod tests {
     fn parse_errors_do_not_echo_values() {
         let e = parse_spec(
             r#"{"tenant":"t","principal":"p","agent":"a","purpose":"x","context":{"ticket.requester":"leak@x"},"tools":"leak@x"}"#,
-            false,
-        )
-        .unwrap_err();
-        assert!(!e.contains("leak@x"), "{e}");
-        let e = parse_spec(
-            "tenant: t\ncontext:\n  ticket.requester: leak@x\ntools: leak@x\n",
-            true,
         )
         .unwrap_err();
         assert!(!e.contains("leak@x"), "{e}");
