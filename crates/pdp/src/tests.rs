@@ -22,6 +22,23 @@ fn mandate_json() -> String {
     .to_string()
 }
 
+/// Mandate validity window around the REAL clock (now - 1h .. now + 1h), for tests whose decide
+/// or ingest path uses wall time (`now: None`, `ingest_output`). Fixed dates here expire.
+fn live_window() -> (String, String) {
+    let (ms, _) = now_rfc3339();
+    let s = ms / 1000;
+    (rfc3339(s - 3600), rfc3339(s + 3600))
+}
+
+/// `mandate_json()` with `live_window()` instead of the fixed NOW-based window.
+fn live_mandate_json() -> String {
+    let mut m: serde_json::Value = serde_json::from_str(&mandate_json()).unwrap();
+    let (nb, ex) = live_window();
+    m["not_before"] = nb.into();
+    m["expires_at"] = ex.into();
+    m.to_string()
+}
+
 fn obs(e: &Engine, t: &str, tool: &str, text: &str) {
     e.observe_output_at(t, None, tool, text, Some(NOW));
 }
@@ -620,6 +637,7 @@ fn cred_engine(t2: Option<sentryra_sidecar_risk::client::Client>) -> (Engine, St
     if let Some(c) = t2 {
         e.set_tier2(std::sync::Arc::new(c), false);
     }
+    let (nb, ex) = live_window();
     let m = serde_json::json!({
         "mandate_id": "mdt_cred", "spec": "sentryra.mandate/v0", "tenant": "org_demo",
         "principal": {"id": "tester@demo"}, "agent": {"id": "agt"},
@@ -629,7 +647,7 @@ fn cred_engine(t2: Option<sentryra_sidecar_risk::client::Client>) -> (Engine, St
              "constraints": {"shell.cmd_prefix": ["pytest"], "untainted_args": ["cmd"]}},
             {"tool": "mail.send", "resource": "mail", "effect": "allow"}
         ],
-        "default_effect": "deny", "not_before": "2026-10-07T12:00:00Z", "expires_at": "2026-10-07T20:00:00Z"
+        "default_effect": "deny", "not_before": nb, "expires_at": ex
     });
     let tok = token::issue(&Mandate::from_json(&m.to_string()).unwrap(), &root)
         .unwrap()
@@ -755,7 +773,18 @@ fn state_keyed_by_verified_mandate_id_and_session_not_token() {
 
 #[test]
 fn serve_ingest_requires_verified_mandate_and_prior_run_decision() {
-    let (e, t, _) = engine(Mode::Enforce);
+    // ingest_output checks the mandate against the wall clock: use a live window and decide
+    // at wall time too.
+    let (e, _, root) = engine(Mode::Enforce);
+    let t = token::issue(&Mandate::from_json(&live_mandate_json()).unwrap(), &root)
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    let req = |tok: &str, tool: &str, args: serde_json::Value| {
+        let mut r = req(tok, tool, args);
+        r.now = None;
+        r
+    };
     let ok = e.decide(&req(
         &t,
         "db.query",
