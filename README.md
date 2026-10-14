@@ -14,6 +14,7 @@ Toolchain: Rust 1.99.0 (`rust-toolchain.toml`), Python 3 for the sample MCP serv
 - **B.** verifies the signed evidence chain offline with `sentryra-verify`, prints the DROP TABLE record and shows that tampering with it is detected.
 - **C.** runs `sentryra-edge serve` (HTTP `POST /v1/decide`) in **shadow** mode (decides and logs, doesn't enforce), and opens the Edge-served approval view for an escalation.
 - **D.** approval receipt flow: escalate → approver (bearer token) approves → signed receipt → retry allowed once; a receipt for different SQL is rejected, and so is a replay.
+- **F.** builds a support mandate with `sentryra-edge mandate new` (replies default to the signed ticket requester), then shows that a long outbound send after untrusted tool output is **held** (`LONG_SEND_HOLD`) while a short reply is allowed.
 - **E.** runs the Tier 1 benchmark locally (results are not published).
 
 ## Commands

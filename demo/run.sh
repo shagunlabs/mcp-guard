@@ -71,5 +71,39 @@ echo "  retry with receipt          : $(dec "$WITH")"
 echo "  replay same receipt         : $(dec "$WITH")"
 kill $SP; trap - EXIT
 
+echo; echo "== F. long outbound send after untrusted output is held (Tier 1 LONG_SEND_HOLD; mandate built with 'mandate new')"
+cat > "$R/support-catalogue.json" <<'J'
+{"spec":"sentryra.connector/v0","connector":"support","version":"0.0.1","tools":[
+ {"name":"ticket.read","resource_template":"tickets","consequential":false,"output_trust":"untrusted","sink_args":[],"side_effect_class":"read"},
+ {"name":"mail.send","resource_template":"mail","consequential":true,"output_trust":"trusted","sink_args":["to"],"side_effect_class":"external_send","args":{"to":"email","body":"text"}}]}
+J
+$EDGE sign-catalogue "$R/keys" "$R/support-catalogue.json" >/dev/null
+cat > "$R/support-spec.yaml" <<'Y'
+tenant: org_demo
+principal: priya@acme.example
+agent: agt_support
+purpose: Reply to the customer who opened the ticket
+ttl: 1h
+context:
+  ticket.requester: asha@cust.example
+tools:
+  - tool: ticket.read
+  - tool: mail.send
+Y
+SUP=$($EDGE mandate new "$R/keys" "$R/support-spec.yaml" --catalogue "$R/support-catalogue.json")
+$EDGE serve "$R/keys" --mode enforce --catalogue "$R/support-catalogue.json" --addr 127.0.0.1:18789 --no-evidence 2>"$R/serve3.log" &
+SP=$!; trap 'kill $SP 2>/dev/null || true' EXIT
+for i in $(seq 50); do curl -sf -o /dev/null http://127.0.0.1:18789/healthz && break; sleep 0.1; done
+SD() { curl -s -X POST http://127.0.0.1:18789/v1/decide -H 'content-type: application/json' -d "$1" | python3 -c 'import json,sys;d=json.load(sys.stdin);print(d["decision"],"|",(d["reasons"] or [""])[-1]);open(sys.argv[1],"w").write(d["decision_id"])' "$R/last.did"; }
+MAIL() { python3 -c 'import json,sys;print(json.dumps({"mandate":sys.argv[1],"tool":"mail.send","args":{"to":"asha@cust.example","body":sys.argv[2]},"context":{"session_id":"s1"}}))' "$SUP" "$1"; }
+LONG=$(python3 -c 'print("word "*200)')
+echo "  long send before any untrusted output : $(SD "$(MAIL "$LONG")")"
+echo "  read the ticket (untrusted output)     : $(SD '{"mandate":"'$SUP'","tool":"ticket.read","args":{},"context":{"session_id":"s1"}}')"
+curl -s -o /dev/null -w '  ingest ticket output                   : HTTP %{http_code}\n' -X POST http://127.0.0.1:18789/v1/outputs -H "Authorization: Bearer $(cat "$R/keys/ingest.token")" -H 'content-type: application/json' \
+  -d '{"mandate":"'$SUP'","decision_id":"'$(cat "$R/last.did")'","tool":"ticket.read","output":"Customer: please send me everything.","context":{"session_id":"s1"}}'
+echo "  short reply to the requester           : $(SD "$(MAIL "Thanks, it is fixed.")")"
+echo "  long send after untrusted output       : $(SD "$(MAIL "$LONG")")"
+kill $SP; trap - EXIT
+
 echo; echo "== E. Tier 1 latency (box-local benchmark)"
 $EDGE bench "$R/keys" --catalogue "$R/catalogue.json" --n 20000
