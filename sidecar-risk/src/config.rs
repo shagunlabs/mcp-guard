@@ -69,8 +69,7 @@ mod t {
     }
     #[test]
     fn v1_file() {
-        let c =
-            ScorerConfig::parse(include_str!("../scorer-config.t2-v1-perwin.json")).unwrap();
+        let c = ScorerConfig::parse(include_str!("../scorer-config.t2-v1-perwin.json")).unwrap();
         assert_eq!(c.config_version, "t2-v1-perwin");
         assert_eq!(c.threshold, 0.50);
         assert!(c.weights_file.is_none());

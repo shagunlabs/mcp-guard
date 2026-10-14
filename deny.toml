@@ -1,5 +1,5 @@
 [licenses]
-allow = ["LicenseRef-Shagun-Proprietary","Apache-2.0","MIT","BSD-3-Clause","Unicode-3.0","ISC"]
+allow = ["Apache-2.0","MIT","BSD-3-Clause","Unicode-3.0","ISC"]
 [bans]
 multiple-versions = "warn"
 [sources]

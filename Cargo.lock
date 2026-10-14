@@ -1609,13 +1609,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sentryra-control"
-version = "0.0.1"
-dependencies = [
- "sentryra-mandate",
-]
-
-[[package]]
 name = "sentryra-edge"
 version = "0.0.1"
 dependencies = [

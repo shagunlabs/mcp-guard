@@ -43,7 +43,6 @@ Performance numbers are not published pre-release. `sentryra-edge bench` is avai
 | `edge/` | `sentryra-edge` binary: HTTP decide API, stdio MCP proxy, doctor, bench, key tooling | Apache-2.0 |
 | `verify/` | `sentryra-verify` offline evidence verifier | Apache-2.0 |
 | `sidecar-risk/` | Tier 2 interface (escalate-only `combine()`), model choices | Apache-2.0 |
-| `control/` | Control plane placeholder | Proprietary, `publish = false` |
 | `spec/` | Open drafts: mandate v0, evidence v0, connector manifest v0 | Apache-2.0 |
 | `demo/` | Sample SQL MCP server, scripted agent, `run.sh` | Apache-2.0 |
 | `deploy/terraform`, `.github/workflows/ci.yml`, `deny.toml` | Skeletons; CI never run remotely | — |

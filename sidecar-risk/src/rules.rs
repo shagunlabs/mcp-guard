@@ -332,14 +332,14 @@ mod t {
     }
     #[test]
     fn near_threshold_band() {
-        for s in [0.44, 0.45, 0.4999, 0.50] {
+        for s in [0.49, 0.495, 0.4999, 0.50] {
             let a = apply(Allow, Write, &resp(s, &[], json!(1), json!(1)), &C, U);
             assert_eq!(a.outcome, Escalate, "{s}");
             assert!(a.codes.contains(&T2_NEAR_THRESHOLD.to_string()), "{s}");
         }
-        let a = apply(Allow, Write, &resp(0.4399, &[], json!(1), json!(1)), &C, U);
+        let a = apply(Allow, Write, &resp(0.46, &[], json!(1), json!(1)), &C, U);
         assert_eq!(a.outcome, Allow);
-        let a = apply(Allow, Write, &resp(0.51, &[], json!(1), json!(1)), &C, U);
+        let a = apply(Allow, Write, &resp(0.54, &[], json!(1), json!(1)), &C, U);
         assert!(!a.codes.contains(&T2_NEAR_THRESHOLD.to_string()));
     }
     #[test]
@@ -510,7 +510,7 @@ mod t {
         let a = apply(
             Allow,
             ExternalSend,
-            &resp(0.49, &[], json!(4), json!(7)),
+            &resp(0.51, &[], json!(4), json!(7)),
             &C,
             U,
         );
