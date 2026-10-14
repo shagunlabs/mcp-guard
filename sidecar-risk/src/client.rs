@@ -988,7 +988,10 @@ mod amx_t {
         let f = d.join("noamx.so");
         std::fs::write(&f, b"not the shim").unwrap();
         let sha = allowlist::sha256_file(&f).unwrap();
-        assert!(verify_noamx_shim(&f, noamx_sha256()).is_err(), "unpinned file refused");
+        assert!(
+            verify_noamx_shim(&f, noamx_sha256()).is_err(),
+            "unpinned file refused"
+        );
         let ok = verify_noamx_shim(&f, &sha).unwrap();
         assert!(ok.is_absolute());
         assert!(verify_noamx_shim(&d.join("missing.so"), &sha).is_err());
@@ -998,7 +1001,10 @@ mod amx_t {
         if real.exists() {
             verify_noamx_shim(&real, noamx_sha256()).unwrap();
         } else {
-            eprintln!("note: {} not built (make noamx); pin check of the real shim skipped", real.display());
+            eprintln!(
+                "note: {} not built (make noamx); pin check of the real shim skipped",
+                real.display()
+            );
         }
     }
 
@@ -1035,7 +1041,10 @@ mod amx_t {
     #[test]
     fn periodic_recheck_fails_closed_if_amx_appears() {
         let c = fake_amx(json!({"xtiledata_granted": true}));
-        assert!(!c.recheck(Duration::from_secs(2)), "probes pass but AMX granted");
+        assert!(
+            !c.recheck(Duration::from_secs(2)),
+            "probes pass but AMX granted"
+        );
         assert!(c.unavailable().unwrap().contains("xtiledata_granted=true"));
         let c = fake_amx(json!({"shim_mapped": true}));
         assert!(!c.recheck(Duration::from_secs(2)), "no proof");
