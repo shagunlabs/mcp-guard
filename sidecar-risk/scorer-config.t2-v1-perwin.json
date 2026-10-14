@@ -6,6 +6,7 @@
   "weights_file": null,
   "weights_sha256": null,
   "threshold": 0.50,
+  "threshold_note": "untuned placeholder",
   "near_margin": 0.03,
   "probe_reference_file": "handoff/probe_refs_v1.json",
   "probe_reference_sha256": "a1928440319bb879072062adc84e074c6236923eb669ecd7af11f088f034f2b1",

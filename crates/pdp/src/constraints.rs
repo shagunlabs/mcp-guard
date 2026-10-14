@@ -25,7 +25,7 @@ pub struct Outcome {
     pub vouched: HashSet<String>,
     /// The block explicitly authorised the DDL verbs in this statement (sql.statement_types).
     pub ddl_ok: bool,
-    /// Obligations to apply to the result (e.g. row_cap). Not yet enforced by the proxy.
+    /// Obligations to apply to the result (e.g. row_cap), enforced on results by the stdio MCP proxy.
     pub obligations: Vec<String>,
 }
 

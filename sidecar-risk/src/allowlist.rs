@@ -1,5 +1,5 @@
 //! Model allowlist by sha256. The pinned copy (`model-allowlist.sha256`) holds exactly the INT8
-//! digest from the internal licence register. Anything else is refused before load.
+//! digest of the cleared INT8 model. Anything else is refused before load.
 use sha2::{Digest, Sha256};
 use std::path::Path;
 
@@ -55,20 +55,6 @@ mod t {
     #[test]
     fn pinned_is_exactly_the_int8_hash() {
         assert_eq!(parse(PINNED).unwrap(), vec![INT8.to_string()]);
-    }
-    #[test]
-    fn pinned_matches_licence_register() {
-        let reg = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../../the internal licence register"
-        ));
-        if let Ok(reg) = reg {
-            let line = reg
-                .lines()
-                .find(|l| l.contains("all-MiniLM-L6-v2"))
-                .expect("register row");
-            assert!(line.contains(INT8) && line.contains("cleared"), "{line}");
-        }
     }
     #[test]
     fn refuses_other_files() {

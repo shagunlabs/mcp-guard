@@ -18,11 +18,11 @@ fn run(args: &[&str]) -> String {
 }
 
 fn scorer_dir() -> Option<PathBuf> {
-    let d = std::env::var_os("SENTRYRA_T2_SCORER")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tier2-prototype")
-        });
+    // Scorer location comes only from the environment; no default path.
+    let Some(d) = std::env::var_os("SENTRYRA_T2_SCORER").map(PathBuf::from) else {
+        eprintln!("skip: SENTRYRA_T2_SCORER not set");
+        return None;
+    };
     let shim = Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/noamx/noamx.so");
     let ort = Command::new("python3")
         .args(["-c", "import onnxruntime, tokenizers"])

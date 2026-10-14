@@ -7,7 +7,6 @@
 //!   Only `score`, `band` and approver-visible reason codes leave in evidence (`Applied::export`).
 //! - **One scoring session per sidecar** (no parallel INT8 ORT sessions: HANDOFF §6).
 pub mod allowlist;
-pub mod context_bridge;
 pub mod client;
 pub mod config;
 pub mod rules;

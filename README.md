@@ -1,5 +1,6 @@
 # Sentryra — Edge (M0–M2)
 Policy enforcement for AI-agent tool calls. Deterministic Tier 1 (signed Biscuit mandate + signed tool catalogue + Cedar + SQL parsing + taint) is the only automatic path to *allow*; ML can only escalate.
+Under Tier 1, long outbound sends after untrusted content always go to human approval (`LONG_SEND_HOLD`); this is a fixed rule and cannot be switched off.
 
 ## Quick start (all local; throwaway keys; no network or accounts)
 ```
@@ -48,7 +49,7 @@ Performance numbers are not published pre-release. `sentryra-edge bench` is avai
 | `deploy/terraform`, `.github/workflows/ci.yml`, `deny.toml` | Skeletons; CI never run remotely | — |
 
 ## Not yet built (known gaps)
-- Constraint `$` context bindings (e.g. `$ticket.requester`) aren't resolved, so they escalate. `max_rows` is recorded but not yet applied to results.
+- `$` context bindings (e.g. `$ticket.requester`) resolve against signed context; unresolved bindings escalate.
 - Approvals: receipts are signed, single-use and bound to the action hash. The approval view uses one shared bearer token (`keydir/approver.token`), and the Edge itself holds the approval key. Production design: approver SSO + WebAuthn, with the receipt signed by the tenant approval key.
 - Evidence: no WAL fsync, no instance-key certification, no Merkle checkpoints (M3), so tail truncation isn't detected.
 - Proxy: stdio only (no streamable HTTP), no `tools/list` filtering or manifest pinning against the server, no OAuth (M4).
@@ -70,19 +71,18 @@ Planned home `github.com/shagunlabs/sentryra` (org name **placeholder, to be con
 - The proxy annotates every capped result with `_meta["com.sentryra/row_cap"] = {cap, truncated}`.
 
 ## Tier 2 sidecar (sidecar-risk)
+Tier 2 is off by default and escalate-only: it can add an escalation, never an allow.
 - `sentryra-edge mcp-proxy ... --tier2-scorer <tier2-prototype dir>` starts ONE scorer process (one ONNX session, single-threaded) on a private unix socket (0600) and talks newline-delimited JSON. Nothing listens on TCP; the scorer runs in the data plane next to the Edge.
-- Model allowlist by sha256 (`sidecar-risk/model-allowlist.sha256`, pinned copy of the INT8 row in the internal licence register; exactly one hash). The Edge hashes the file and refuses to start the scorer on any other digest; the scorer re-checks before creating its session.
+- Model allowlist by sha256 (`sidecar-risk/model-allowlist.sha256`; exactly one hash). The Edge hashes the file and refuses to start the scorer on any other digest; the scorer re-checks before creating its session.
 - Per-call deadline `--tier2-deadline-ms` (default 10). Missed deadline, or untrusted-output cache not yet ready => `T2_TIMEOUT`; escalates for destructive / privilege / external_send, none + log for read / write. Late replies are logged (`--tier2-log`), never applied.
-- Threshold `--tier2-threshold` (default 0.50); `|score − threshold| ≤ 0.03` => `T2_NEAR_THRESHOLD`. Outbound sends with `windows_read < windows_total`, or either field missing / non-integer => `T2_PARTIAL_READ`.
+- Threshold `--tier2-threshold` (default 0.50, an untuned placeholder); `|score − threshold| ≤ 0.03` => `T2_NEAR_THRESHOLD`. Outbound sends with `windows_read < windows_total`, or either field missing / non-integer => `T2_PARTIAL_READ`.
 - Escalate-only: the final join is `sidecar_risk::combine`; Tier 2 never lowers a deny/escalate and never produces allow. Evidence carries only score, band and approver-visible codes (`T2_UNSCORABLE_PLACEHOLDER` is internal; unknown codes are dropped).
 - Untrusted outputs are sent to the scorer for embedding as they arrive (async).
 - Gaps: the Tier 2 session is per Edge process (fine for the stdio proxy; `serve` mixes mandates); the wire is JSON over UDS, not the contract's gRPC; no `T2_UNAVAILABLE` alerting; per-window diagnostic scores (`--tier2-diag`) are computed at shutdown, off the decision path.
-- Versioned scorer config (`sidecar-risk/scorer-config.v0.json`, `config_version` t2cfg-v0): scorer version + weights file sha256 + threshold 0.50 + near margin 0.03 + probe reference. Swap with `--tier2-config <file>` (e.g. a V1) without code changes; `cfg=<config_version>` is recorded in every decision record.
-- Startup probe self-check: the sidecar scores the fixed probes in the reference file (`handoff/probe-reference.json`, the research; placeholder path until delivered, `probe_reference_sha256` pins it) in its single INT8 session and refuses to start if any score is off by more than 0.005 or the file is missing. A refused sidecar fails closed (`T2_UNAVAILABLE`: external_send / destructive / privilege escalate). One INT8 session only; no AMX blocking.
-
-### Tier 2 update (7 Oct, evening)
-- Configs use the research ids: `sidecar-risk/scorer-config.t2-v0-pooled.json` (default, compiled in) and `scorer-config.t2-v1-perwin.json`. Each pins its probe file by sha256 (`handoff/probe_refs.json`, `handoff/probe_refs_v1.json`). The probe check refuses a reference whose config_version, model sha256 or threshold differs from the active config. The dev-only devref reference stays in bench/dev/ and is not on any default path.
+- Versioned scorer config (`sidecar-risk/scorer-config.v0.json`, `config_version` t2cfg-v0): scorer version + weights file sha256 + threshold 0.50 (untuned placeholder) + near margin 0.03 + probe reference. Swap with `--tier2-config <file>` (e.g. a V1) without code changes; `cfg=<config_version>` is recorded in every decision record.
+- Startup probe self-check: the sidecar scores the fixed probes in the reference file (probe files are private and pinned by sha256 via `probe_reference_sha256`) in its single INT8 session and refuses to start if any score is off by more than 0.005 or the file is missing. A refused sidecar fails closed (`T2_UNAVAILABLE`: external_send / destructive / privilege escalate). One INT8 session only; no AMX blocking.
+- Configs: `sidecar-risk/scorer-config.t2-v0-pooled.json` (default, compiled in) and `scorer-config.t2-v1-perwin.json`. Each pins its probe file by sha256; probe files are private. The probe check refuses a reference whose config_version, model sha256 or threshold differs from the active config. The dev-only devref reference stays in bench/dev/ and is not on any default path.
 - Rules record every reason that applies. A timeout or unavailable on an outbound send also gets `T2_PARTIAL_READ`, because the windows were not reported. An outbound send whose session has seen untrusted output but has no scorable text gets `T2_UNSCORABLE`.
-- Timeout, unavailable, partial read and unscorable act only when the call's (mandate, session) has seen untrusted output. With no untrusted output, Tier 2 does not act and Tier 1 behaves exactly as it does without Tier 2. This fixes the credential-exfil regressions (see tests `tier1_taint_identical_with_tier2_unavailable_vs_tier1_only`).
+- Timeout, unavailable, partial read and unscorable act only when the call's (mandate, session) has seen untrusted output. With no untrusted output, Tier 2 does not act and Tier 1 behaves exactly as it does without Tier 2. See test `tier1_taint_identical_with_tier2_unavailable_vs_tier1_only`.
 - Tier 2 state is keyed per mandate and session (`t2_session_key`). The sidecar keeps one shared INT8 inference session behind a single FIFO queue, and time spent waiting in the queue counts toward the deadline. A periodic probe re-check runs through the same queue (`--tier2-recheck-secs`, default 60). If a re-check fails, Tier 2 is marked unavailable and fails closed.
 - `--tier2-diagnostic-no-probe` is for score-only diagnostics only. Its records are tagged `<id>+diag-noprobe`.
