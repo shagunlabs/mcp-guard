@@ -17,6 +17,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 hex.workspace = true
 serde_json.workspace = true
+serde_yaml = "0.9"
 serde.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
 axum = "0.8"

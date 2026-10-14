@@ -20,6 +20,7 @@ Toolchain: Rust 1.99.0 (`rust-toolchain.toml`), Python 3 for the sample MCP serv
 ```
 sentryra-edge keygen <keydir>
 sentryra-edge sign-catalogue <keydir> <manifest.json>
+sentryra-edge mandate new <keydir> <spec.yaml|json> [--catalogue m.json]   # build + sign from a small spec
 sentryra-edge issue <keydir> <mandate.json>               # Biscuit v3 token (base64)
 sentryra-edge attenuate <keydir> <token> <tool> <resource> [expires_at]
 sentryra-edge revocation-ids <keydir> <token>
@@ -29,6 +30,27 @@ sentryra-edge bench <keydir> --catalogue m.json [--n 20000]
 sentryra-edge doctor [--no-network] [--home DIR]          # standing-credential + egress lockdown report (names/paths only)
 sentryra-verify <evidence.jsonl> <evidence.pub>
 ```
+
+### Building a mandate from a spec (`mandate new`)
+`sentryra-edge mandate new <keydir> <spec.yaml|spec.json> [--catalogue m.json] [--json-out f]` builds and signs a mandate and prints the token. Every scope gets default-deny around it, and `not_before`/`expires_at` come from `ttl` (default `8h`, max `30d`).
+
+    tenant: org_acme
+    principal: priya@acme.example
+    agent: support-bot
+    purpose: Answer support tickets
+    ttl: 8h
+    context:
+      ticket.requester: customer@cust.example   # signed into the mandate
+    tools:
+      - tool: ticket.read
+      - tool: mail.send          # external_send in the signed catalogue (or set `class: external_send`)
+
+Recipients for `external_send` tools:
+- **Default:** if the spec signs a `ticket.requester` context field, every `external_send` scope with no recipient rule gets `mail.recipients: ["$ticket.requester"]`, so the agent can only reply to the person who opened the ticket.
+- **Override:** `recipients: [ops@acme.example, ...]` sets an explicit allowlist, and a `mail.recipients` or `mail.recipient_domains` constraint is kept as written.
+- **Opt-out:** `recipients: escalate` (needs `approvers`) holds every send through that scope for approval.
+
+The side-effect class is read from `--catalogue` only when its `.sig` verifies with the keydir's catalogue key. Signed context values are never printed or logged; the summary on stderr names context keys only. `--json-out` writes the unsigned mandate JSON (which includes the values) with mode 0600.
 
 ## Performance
 Performance numbers are not published pre-release. `sentryra-edge bench` is available for local measurement.

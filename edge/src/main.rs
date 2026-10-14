@@ -1,5 +1,6 @@
 //! Sentryra Edge: decide API, stdio MCP proxy, key/mandate tooling, onboarding doctor, benchmark.
 mod doctor;
+mod mandate_new;
 mod proxy;
 
 use biscuit_auth::{Algorithm, KeyPair, PrivateKey};
@@ -15,6 +16,10 @@ const USAGE: &str = "usage: sentryra-edge <command>
   keygen <keydir>                               create local demo keys (root, catalogue, evidence, salt)
   sign-catalogue <keydir> <manifest.json>       write <manifest.json>.sig
   issue <keydir> <mandate.json>                 print a signed Biscuit mandate (base64)
+  mandate new <keydir> <spec.yaml|json> [--catalogue m.json] [--json-out f]
+                                                build + sign a mandate from a small spec, print the token
+                                                (external_send tools default to mail.recipients [$ticket.requester]
+                                                when the spec signs ticket.requester; context values are never printed)
   attenuate <keydir> <token> <tool> <resource> [expires_at]
   revocation-ids <keydir> <token>
   serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, GET /v1/evidence
@@ -313,6 +318,74 @@ fn attach_tier2(e: &mut Engine, o: &Opts) {
     e.set_tier2_dev_export(o.t2_dev_export);
 }
 
+fn mandate_cmd(a: &[String]) {
+    const U: &str = "usage: sentryra-edge mandate new <keydir> <spec.yaml|spec.json> [--catalogue <manifest.json>] [--json-out <file>]";
+    let (Some(sub), Some(d), Some(spec_p)) = (a.first(), a.get(1), a.get(2)) else {
+        die(U)
+    };
+    if sub != "new" {
+        die(U);
+    }
+    let d = PathBuf::from(d);
+    let (mut cat, mut json_out) = (None, None);
+    let mut i = 3;
+    while i < a.len() {
+        let v = a.get(i + 1).cloned().unwrap_or_else(|| die(U));
+        match a[i].as_str() {
+            "--catalogue" => cat = Some(v),
+            "--json-out" => json_out = Some(v),
+            x => die(format!("mandate new: unknown argument {x}\n{U}")),
+        }
+        i += 2;
+    }
+    let mut classes = std::collections::BTreeMap::new();
+    if let Some(c) = cat {
+        // Only a catalogue signed with this keydir's catalogue key is trusted for side-effect classes.
+        let bytes = std::fs::read(&c).unwrap_or_else(|e| die(format!("{c}: {e}")));
+        let sig: [u8; 64] = hex::decode(read(format!("{c}.sig")).trim())
+            .ok()
+            .and_then(|v| v.try_into().ok())
+            .unwrap_or_else(|| die(format!("{c}.sig: bad signature file")));
+        ed25519_dalek::Verifier::verify(
+            &ed_key(&d, "catalogue.key").verifying_key(),
+            &bytes,
+            &ed25519_dalek::Signature::from_bytes(&sig),
+        )
+        .unwrap_or_else(|_| die(format!("{c}: catalogue signature does not verify")));
+        let m: sentryra_connector_manifest::Manifest =
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| die(format!("manifest: {e}")));
+        for t in m.tools {
+            if let Some(k) = t.side_effect_class {
+                classes.insert(t.name, k);
+            }
+        }
+    }
+    let yaml = spec_p.ends_with(".yaml") || spec_p.ends_with(".yml");
+    let spec = mandate_new::parse_spec(&read(spec_p), yaml).unwrap_or_else(|e| die(e));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let (m, rules) = mandate_new::build(spec, &classes, now).unwrap_or_else(|e| die(e));
+    let t = token::issue(&m, &root_key(&d)).unwrap_or_else(|e| die(e));
+    if let Some(p) = json_out {
+        // Holds the signed context values: written owner-only, never echoed.
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&p)
+            .unwrap_or_else(|e| die(format!("{p}: {e}")));
+        f.write_all(serde_json::to_string_pretty(&m).unwrap().as_bytes())
+            .unwrap_or_else(|e| die(format!("{p}: {e}")));
+    }
+    eprint!("{}", mandate_new::summary(&m, &rules));
+    println!("{}", t.to_base64().unwrap());
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = a.first() else { die(USAGE) };
@@ -397,6 +470,7 @@ fn main() {
                 println!("{id}");
             }
         }
+        "mandate" => mandate_cmd(&a[1..]),
         "serve" => {
             let d = need_dir();
             let o = opts(&a[2..]);
