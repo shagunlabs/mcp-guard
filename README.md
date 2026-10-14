@@ -13,7 +13,7 @@ Toolchain: Rust 1.99.0 (`rust-toolchain.toml`), Python 3 for the sample MCP serv
 - **B.** verifies the signed evidence chain offline with `sentryra-verify`, prints the DROP TABLE record and shows that tampering with it is detected.
 - **C.** runs `sentryra-edge serve` (HTTP `POST /v1/decide`) in **shadow** mode (decides and logs, doesn't enforce), and opens the Edge-served approval view for an escalation.
 - **D.** approval receipt flow: escalate → approver (bearer token) approves → signed receipt → retry allowed once; a receipt for different SQL is rejected, and so is a replay.
-- **E.** runs the Tier 1 latency benchmark.
+- **E.** runs the Tier 1 benchmark locally (results are not published).
 
 ## Commands
 ```
@@ -29,14 +29,8 @@ sentryra-edge doctor [--no-network] [--home DIR]          # standing-credential 
 sentryra-verify <evidence.jsonl> <evidence.pub>
 ```
 
-## Measured Tier 1 latency (box-local benchmark)
-`sentryra-edge bench`, release build, in-process `decide()` over 20,000 decisions (allow/deny/escalate mix), including Biscuit verification, SQL parsing, taint lookup, Cedar evaluation and the signed evidence append (no fsync, no network). Measured on the shared dev box (8 vCPUs), 2026-10-07:
-
-| p50 | p90 | p99 |
-|---|---|---|
-| [not published] | [not published] | [not published] |
-
-This is a box-local micro-benchmark, not a published number: no WAL fsync, no gRPC/HTTP hop, no Tier 2, no replayed design-partner traces. Through the stdio proxy with a replay server, client round-trip was [not published] (see `../bench`).
+## Performance
+Performance numbers are not published pre-release. `sentryra-edge bench` is available for local measurement.
 
 ## Layout
 | Path | What | Licence |

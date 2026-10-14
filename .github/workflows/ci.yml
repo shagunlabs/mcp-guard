@@ -12,6 +12,8 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (2026-10-14)
         with: { toolchain: stable, components: "rustfmt, clippy" }
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc  # noamx shim build (deploy/noamx/build.sh)
+      - run: make noamx  # builds + sha256-checks the shim used by edge t2_amx tests
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
@@ -25,9 +27,13 @@ jobs:
       - run: cargo install --locked cargo-deny cargo-audit
       - run: cargo deny check
       - run: cargo audit
-      - name: secret scan
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2.3.9
-        env: { GITHUB_TOKEN: "${{ github.token }}" }  # org repos also need secrets.GITLEAKS_LICENSE
+      - name: secret scan (pinned gitleaks CLI, full history, no licence needed)
+        env: { GITLEAKS_VERSION: "8.30.1", GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb" }
+        run: |
+          curl -sSfL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --redact --exit-code 1 .
   terraform:
     runs-on: ubuntu-latest
     steps:
