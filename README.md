@@ -49,7 +49,6 @@ Performance numbers are not published pre-release. `sentryra-edge bench` is avai
 | `deploy/terraform`, `.github/workflows/ci.yml`, `deny.toml` | Skeletons; CI never run remotely | — |
 
 ## Not yet built (known gaps)
-- `$` context bindings (e.g. `$ticket.requester`) resolve against signed context; unresolved bindings escalate.
 - Approvals: receipts are signed, single-use and bound to the action hash. The approval view uses one shared bearer token (`keydir/approver.token`), and the Edge itself holds the approval key. Production design: approver SSO + WebAuthn, with the receipt signed by the tenant approval key.
 - Evidence: no WAL fsync, no instance-key certification, no Merkle checkpoints (M3), so tail truncation isn't detected.
 - Proxy: stdio only (no streamable HTTP), no `tools/list` filtering or manifest pinning against the server, no OAuth (M4).
@@ -66,7 +65,7 @@ Planned home `github.com/shagunlabs/sentryra` (org name **placeholder, to be con
 - Uncatalogued tools: every argument is a sink (they also escalate as destructive).
 - `max_rows` is enforced on results at the proxy: JSON arrays (or `{rows:[...]}`) are truncated, other text by line; `_meta["com.sentryra/row_cap"]` marks the cut.
 - Mandate scope resources support globs (`*` within a segment, `**` across segments).
-- `$name` bindings in constraints (e.g. `idp.users: ["$ticket.requester"]`) resolve only from trusted context: the signed mandate `context` (wins), host-supplied context (`SENTRYRA_CONTEXT` for the proxy, `context` on `/v1/decide`), and built-in `$principal.id`. Never from agent args or tool outputs. Unresolved bindings escalate.
+- `$` bindings resolve against signed context; unresolved bindings escalate. `$name` bindings in constraints (e.g. `idp.users: ["$ticket.requester"]`) resolve only from trusted context: the signed mandate `context` (wins), host-supplied context (`SENTRYRA_CONTEXT` for the proxy, `context` on `/v1/decide`), and built-in `$principal.id`. Never from agent args or tool outputs.
 - SQL taint: the free-text `purpose` never clears SQL identifiers; only `sql.tables` and signed mandate `context` values do. Table names NOT so allowed, plus string and number literals, are taint-checked (columns/identifiers are not). Numeric literals 0–99 are ignored as non-identifying.
 - The proxy annotates every capped result with `_meta["com.sentryra/row_cap"] = {cap, truncated}`.
 
