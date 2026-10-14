@@ -1,0 +1,16 @@
+Sentryra / mcp-guard
+Copyright 2026 Shagun Labs
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes or uses the following third-party components:
+
+1. all-MiniLM-L6-v2 (INT8 ONNX export), by sentence-transformers
+   Revision 1110a243fdf4706b3f48f1d95db1a4f5529b4d41
+   Licensed under the Apache License, Version 2.0.
+   https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2
+
+2. ONNX Runtime
+   Copyright (c) Microsoft Corporation.
+   Licensed under the MIT License.
+   https://github.com/microsoft/onnxruntime
