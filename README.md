@@ -83,7 +83,7 @@ Performance numbers are not published pre-release. `sentryra-edge bench` is avai
 - `doctor` is a heuristic name/path scan, and the egress probe checks 4 public destinations.
 
 ## Repository
-Planned home `github.com/shagunlabs/sentryra` (org name **placeholder, to be confirmed**). No remote configured; nothing pushed.
+Home: `github.com/shagunlabs/mcp-guard`.
 
 ## Taint matching (v0.3)
 - Typed sinks (table, recipient, branch, amount, host, path, channel, group, id, URL, cmd, SQL; from manifest `args` or inferred from the name) match exact normalized atoms with no length minimum. URLs are parsed into host/path/query; paths match on segment suffixes; shell `$VAR` sigils are stripped; SQL matches tables, identifiers and literals.
