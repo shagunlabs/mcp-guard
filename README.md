@@ -79,7 +79,7 @@ Performance numbers are not published pre-release. `sentryra-edge bench` is avai
 - Approvals: receipts are signed, single-use and bound to the action hash. The approval view uses one shared bearer token (`keydir/approver.token`), and the Edge itself holds the approval key. Production design: approver SSO + WebAuthn, with the receipt signed by the tenant approval key.
 - Evidence: no WAL fsync, no instance-key certification, no Merkle checkpoints (M3), so tail truncation isn't detected.
 - Proxy: stdio only (no streamable HTTP), no `tools/list` filtering or manifest pinning against the server, no OAuth (M4).
-- Taint: fingerprints need ≥12-char atoms or ≥16-char 3–4-word shingles with entropy ≥3.0 bits/char, so short copied values (≤11 chars) go undetected, as do paraphrased or encoded copies. Only declared sink args are checked. Copies that pass an explicit mandate allowlist are recorded as a signal only.
+- Taint: in free-text args, fingerprints need ≥12-char atoms or ≥16-char 3–4-word shingles with entropy ≥3.0 bits/char, so short copied values (≤11 chars) in free text go undetected, as do paraphrased copies and encodings deeper than two decoding passes. Typed sinks match exact atoms with no length minimum (see Taint matching below). For catalogued tools only declared sink args are checked; uncatalogued tools treat every arg as a sink. Copies that pass an explicit mandate allowlist are recorded as a signal only.
 - `doctor` is a heuristic name/path scan, and the egress probe checks 4 public destinations.
 
 ## Repository
