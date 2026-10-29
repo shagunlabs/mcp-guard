@@ -21,4 +21,10 @@ unknown-git = "deny"
 # this advisory id only. Revisit when biscuit-auth drops biscuit-quote's dep.
 ignore = [
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive via biscuit-quote (biscuit-auth 6.0.0); no safe upgrade available" },
+    # crypto-bigint 0.5.5 (timing variability in constant-time ops) comes only through biscuit-auth 6.0.0
+    # -> p256/ecdsa/elliptic-curve 0.13. The fix (crypto-bigint >= 0.7.6) needs a biscuit-auth release on
+    # elliptic-curve 0.14; 6.0.0 is the latest. Sentryra loads its root key as Ed25519 only
+    # (edge/src/main.rs, Algorithm::Ed25519) and never creates or verifies P-256 keys, so the affected
+    # P-256 code is compiled in but not used. Revisit on the next biscuit-auth release; remove this ignore then.
+    { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 via biscuit-auth 6.0.0 P-256 support only; Sentryra uses Ed25519 keys only; no patched biscuit-auth release yet" },
 ]
