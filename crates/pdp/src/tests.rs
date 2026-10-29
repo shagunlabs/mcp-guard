@@ -1533,3 +1533,120 @@ fn deny_records_evidence_and_blocks_approve_and_receipts() {
         r.reasons
     );
 }
+
+fn engine_at(root: &KeyPair, evidence: &std::path::Path) -> Engine {
+    let cat = SigningKey::generate(&mut rand::rngs::OsRng);
+    let man = include_bytes!("../../../spec/examples/connector-demo-db.json").to_vec();
+    let sig = hex::encode(cat.sign(&man).to_bytes());
+    Engine::new(Config {
+        root: root.public(),
+        catalogue_key: cat.verifying_key(),
+        manifests: vec![(man, sig)],
+        policies: include_str!("../../../policies/default.cedar").into(),
+        evidence_key: SigningKey::generate(&mut rand::rngs::OsRng),
+        salt_key: b"k".to_vec(),
+        mode: Mode::Enforce,
+        evidence_path: Some(evidence.to_path_buf()),
+        edge_url: "http://edge".into(),
+        revoked: Default::default(),
+        approval_vk: approval_key().verifying_key(),
+        approval_sk: Some(approval_key()),
+    })
+    .unwrap()
+}
+
+fn temp_dir(tag: &str) -> std::path::PathBuf {
+    let d = std::env::temp_dir().join(format!(
+        "sentryra-test-{tag}-{}-{}",
+        std::process::id(),
+        wall_ms()
+    ));
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+#[test]
+fn consumed_receipt_survives_restart() {
+    let d = temp_dir("consumed");
+    let ev = d.join("evidence.jsonl");
+    let root = KeyPair::new();
+    let t = token::issue(&Mandate::from_json(&mandate_json()).unwrap(), &root)
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    let args = serde_json::json!({"db": "demo", "sql": "DELETE FROM users WHERE id = 5"});
+    let rc = {
+        let e = engine_at(&root, &ev);
+        let r1 = e.decide(&req(&t, "db.query", args.clone()));
+        assert_eq!(r1.decision, "escalate");
+        let rc = e.approve(&r1.decision_id, "sre").unwrap();
+        let mut ok = req(&t, "db.query", args.clone());
+        ok.receipt = Some(rc.clone());
+        assert_eq!(e.decide(&ok).decision, "allow");
+        rc
+    };
+    let f = super::consumed::path_for(&ev);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+    // restart: a new Engine on the same dir refuses the reused receipt
+    let e2 = engine_at(&root, &ev);
+    let mut again = req(&t, "db.query", args);
+    again.receipt = Some(rc);
+    let r = e2.decide(&again);
+    assert_eq!(r.decision, "escalate");
+    assert!(
+        r.reasons.iter().any(|s| s.contains("AlreadyUsed")),
+        "{:?}",
+        r.reasons
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn consumed_file_drops_expired_entries_on_load() {
+    let d = temp_dir("consumed-expiry");
+    let f = d.join("x.consumed-receipts");
+    std::fs::write(
+        &f,
+        "{\"apr_id\":\"old\",\"expires_ms\":1}\n{\"apr_id\":\"live\",\"expires_ms\":99999999999999}\n{\"apr_id\":\"torn",
+    )
+    .unwrap();
+    let (m, _) = super::consumed::open(&f, 10 * 60 * 1000).unwrap();
+    assert!(m.contains_key("live") && !m.contains_key("old") && m.len() == 1);
+    assert_eq!(std::fs::read_to_string(&f).unwrap().lines().count(), 1);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consumed_write_failure_refuses_the_receipt() {
+    let d = temp_dir("consumed-fail");
+    let root = KeyPair::new();
+    let e = engine_at(&root, &d.join("evidence.jsonl"));
+    let t = token::issue(&Mandate::from_json(&mandate_json()).unwrap(), &root)
+        .unwrap()
+        .to_base64()
+        .unwrap();
+    // every write to /dev/full fails with ENOSPC
+    e.state.lock().unwrap().consumed_file = Some(
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap(),
+    );
+    let args = serde_json::json!({"db": "demo", "sql": "DELETE FROM users WHERE id = 6"});
+    let r1 = e.decide(&req(&t, "db.query", args.clone()));
+    let rc = e.approve(&r1.decision_id, "sre").unwrap();
+    let mut ok = req(&t, "db.query", args);
+    ok.receipt = Some(rc);
+    let r = e.decide(&ok);
+    assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+    assert!(r.reasons.iter().any(|s| s.contains("NotPersisted")));
+    let _ = std::fs::remove_dir_all(&d);
+}

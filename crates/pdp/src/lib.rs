@@ -21,6 +21,7 @@ pub enum IngestError {
 
 pub mod bindings;
 pub mod constraints;
+mod consumed;
 pub mod long_send;
 pub mod receipts;
 pub mod sql;
@@ -167,7 +168,10 @@ struct State {
     pending: HashMap<String, PendingApproval>,
     file: Option<std::fs::File>,
     counter: u64,
-    consumed: HashSet<String>,
+    /// Used receipt ids -> receipt expiry (ms). Persisted (when there is an evidence path) to
+    /// `<evidence>.consumed-receipts`, so a receipt stays single-use across restarts.
+    consumed: HashMap<String, u64>,
+    consumed_file: Option<std::fs::File>,
     /// Escalation decision ids denied via `deny`: never approvable again, and any receipt
     /// already issued for them is refused.
     denied: HashSet<String>,
@@ -280,6 +284,11 @@ impl Engine {
             ),
             None => None,
         };
+        let (consumed, consumed_file) = match &c.evidence_path {
+            Some(p) => consumed::open(&consumed::path_for(p), wall_ms())
+                .map_err(|e| EngineError(format!("consumed receipts file: {e}")))?,
+            None => (HashMap::new(), None),
+        };
         Ok(Self {
             root: c.root,
             tools,
@@ -298,7 +307,8 @@ impl Engine {
                 pending: HashMap::new(),
                 file,
                 counter: 0,
-                consumed: HashSet::new(),
+                consumed,
+                consumed_file,
                 denied: HashSet::new(),
             }),
             tier2: None,
@@ -770,15 +780,21 @@ impl Engine {
                 let res = receipts::check(r, &self.approval_vk, &ahash, wall_ms()).and_then(|_| {
                     if st.denied.contains(&r.decision_id) {
                         Err(receipts::ReceiptError::Denied)
-                    } else if st.consumed.contains(&r.apr_id) {
+                    } else if st.consumed.contains_key(&r.apr_id) {
                         Err(receipts::ReceiptError::AlreadyUsed)
                     } else {
                         Ok(())
                     }
                 });
+                // Persist the id BEFORE accepting the receipt; if that fails, refuse (fail closed).
+                let res = res.and_then(|_| {
+                    let now = wall_ms();
+                    let st = &mut *st;
+                    consumed::record(&mut st.consumed, st.consumed_file.as_mut(), r, now)
+                        .map_err(|_| receipts::ReceiptError::NotPersisted)
+                });
                 match res {
                     Ok(()) => {
-                        st.consumed.insert(r.apr_id.clone());
                         decision = "allow".into();
                         policy_ids.push("approval-receipt".into());
                         reasons.push(format!(
