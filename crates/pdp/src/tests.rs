@@ -1650,3 +1650,23 @@ fn consumed_write_failure_refuses_the_receipt() {
     assert!(r.reasons.iter().any(|s| s.contains("NotPersisted")));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn allow_on_retry_links_to_escalation_record() {
+    let (e, t, _) = engine(Mode::Enforce);
+    let args = serde_json::json!({"db": "demo", "sql": "DELETE FROM users WHERE id = 7"});
+    let r1 = e.decide(&req(&t, "db.query", args.clone()));
+    let rc = e.approve(&r1.decision_id, "sre").unwrap();
+    let mut ok = req(&t, "db.query", args);
+    ok.receipt = Some(rc);
+    assert_eq!(e.decide(&ok).decision, "allow");
+    let es = e.entries();
+    let esc = es.iter().find(|x| x.decision_id == r1.decision_id).unwrap();
+    assert!(esc.escalation_decision_id.is_none());
+    let last = es.last().unwrap();
+    assert_eq!(
+        last.escalation_decision_id.as_deref(),
+        Some(r1.decision_id.as_str())
+    );
+    assert!(sentryra_evidence::verify(&es, None).is_ok());
+}

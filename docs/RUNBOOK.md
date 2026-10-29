@@ -128,6 +128,8 @@ Each decision carries `reasons` and `policy_ids`. Tier 2 is escalate-only: it ne
 - **HTTP:** `GET /v1/evidence` with `Authorization: Bearer <approver.token>`.
 - **Verify offline:** `sentryra-verify evidence.jsonl /keys/evidence.pub`. In the image: `podman run --rm --entrypoint /sentryra-verify -v …:/data -v …:/keys sentryra-edge:0.0.1 /data/evidence.jsonl /keys/evidence.pub`.
 
+The allow record of an approved retry has `escalation_decision_id` set to the held call's `decision_id`, and `approval` set to the receipt's SHA-256; refusals and denials also carry `escalation_decision_id`.
+
 Entries hold salted digests of arguments, never raw secrets in the clear. Share `evidence.pub` with your auditors.
 
 ## 7. Rollback

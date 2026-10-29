@@ -772,6 +772,7 @@ impl Engine {
         // Approval receipt: can turn an escalate into allow, exactly once, for exactly this action.
         let ahash = receipts::action_hash(&mandate_id, &req.tool, &resource, &req.args);
         let mut approval: Option<String> = None;
+        let mut escalation_decision_id: Option<String> = None;
         if let Some(r) = &req.receipt {
             if decision != "escalate" {
                 reasons.push(format!("receipt ignored: a receipt can only resolve an escalation (decision is {decision})"));
@@ -803,6 +804,9 @@ impl Engine {
                         ));
                         approval =
                             Some(hex::encode(Sha256::digest(serde_json::to_vec(r).unwrap())));
+                        // Signed into the receipt by the approval key: links this allow record to
+                        // the escalation record it resolves.
+                        escalation_decision_id = Some(r.decision_id.clone());
                     }
                     Err(e) => reasons.push(format!("receipt rejected: {e:?}")),
                 }
@@ -829,6 +833,7 @@ impl Engine {
             policy_ids: policy_ids.clone(),
             reasons: reasons.clone(),
             approval: approval.clone(),
+            escalation_decision_id,
         });
         let (seq, entry_hash) = (e.seq, e.entry_hash.clone());
         let line = serde_json::to_string(e).unwrap();
@@ -1019,6 +1024,7 @@ impl Engine {
             policy_ids,
             reasons,
             approval: None,
+            escalation_decision_id: Some(p.decision_id.clone()),
         });
         let line = serde_json::to_string(e).unwrap();
         write_line(st, &line);

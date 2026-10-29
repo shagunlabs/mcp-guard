@@ -37,6 +37,10 @@ pub struct Entry {
     /// SHA-256 of the approval receipt that resolved this escalation, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval: Option<String>,
+    /// On an allow-on-retry (or an approval refusal/denial): the `decision_id` of the escalation
+    /// record it resolves, linking the two records. Absent on older entries, which hash as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub escalation_decision_id: Option<String>,
     pub prev_hash: String,
     #[serde(default)]
     pub entry_hash: String,
@@ -60,6 +64,7 @@ pub struct NewEntry<'a> {
     pub policy_ids: Vec<String>,
     pub reasons: Vec<String>,
     pub approval: Option<String>,
+    pub escalation_decision_id: Option<String>,
 }
 
 pub fn salted_hash(key: &[u8], value: &serde_json::Value) -> String {
@@ -126,6 +131,7 @@ impl Chain {
             policy_ids: n.policy_ids,
             reasons: n.reasons,
             approval: n.approval,
+            escalation_decision_id: n.escalation_decision_id,
             prev_hash: prev,
             entry_hash: String::new(),
             sig: String::new(),
@@ -197,6 +203,7 @@ mod tests {
                 policy_ids: vec![],
                 reasons: vec![],
                 approval: None,
+                escalation_decision_id: None,
             });
         }
         c
@@ -234,6 +241,70 @@ mod tests {
         let c = chain();
         let s = serde_json::to_string(&c.entries).unwrap();
         assert!(!s.contains("priya") && !s.contains("SELECT"));
+    }
+    #[test]
+    fn linked_escalation_and_allow_records() {
+        let mut c = chain();
+        let args = serde_json::json!({"sql": "DELETE FROM t"});
+        let mut n = |id: &str, d: &str, link: Option<&str>| {
+            c.append(NewEntry {
+                ts_ms: 9,
+                decision_id: id,
+                mandate_id: "m",
+                tool: "db.query",
+                resource: "db:demo",
+                args: &args,
+                principal: "p",
+                tainted: false,
+                decision: d,
+                mode: "enforce",
+                enforced: true,
+                policy_ids: vec![],
+                reasons: vec![],
+                approval: link.map(|_| "receipt-sha".into()),
+                escalation_decision_id: link.map(String::from),
+            });
+        };
+        n("dec_esc", "escalate", None);
+        n("dec_ok", "allow", Some("dec_esc"));
+        let k = c.verifying_key();
+        assert!(verify(&c.entries, Some(&k)).is_ok());
+        // round-trip through JSON lines (what sentryra-verify reads)
+        let lines: Vec<Entry> = c
+            .entries
+            .iter()
+            .map(|e| serde_json::from_str(&serde_json::to_string(e).unwrap()).unwrap())
+            .collect();
+        assert!(verify(&lines, Some(&k)).is_ok());
+        assert_eq!(
+            lines[6].escalation_decision_id.as_deref(),
+            Some(lines[5].decision_id.as_str())
+        );
+        assert!(!serde_json::to_string(&lines[5])
+            .unwrap()
+            .contains("escalation_decision_id"));
+        let mut bad = lines.clone();
+        bad[6].escalation_decision_id = Some("dec_other".into());
+        assert_eq!(verify(&bad, Some(&k)), Err(VerifyError::BadHash(6)));
+        let mut gone = lines;
+        gone[6].escalation_decision_id = None;
+        assert_eq!(verify(&gone, Some(&k)), Err(VerifyError::BadHash(6)));
+    }
+    #[test]
+    fn old_entry_without_link_field_still_parses_and_verifies() {
+        let c = chain();
+        let k = c.verifying_key();
+        // Entries written before the field existed serialise identically (field omitted).
+        let old: Vec<Entry> = c
+            .entries
+            .iter()
+            .map(|e| {
+                let mut v = serde_json::to_value(e).unwrap();
+                v.as_object_mut().unwrap().remove("escalation_decision_id");
+                serde_json::from_value(v).unwrap()
+            })
+            .collect();
+        assert!(verify(&old, Some(&k)).is_ok());
     }
     // Tail truncation is NOT detectable by a chain alone: M3 signed checkpoints close that.
     #[test]
