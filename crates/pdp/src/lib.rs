@@ -21,6 +21,7 @@ pub enum IngestError {
 
 pub mod bindings;
 pub mod constraints;
+mod consumed;
 pub mod long_send;
 pub mod receipts;
 pub mod sql;
@@ -98,6 +99,44 @@ pub struct PendingApproval {
     pub reasons: Vec<String>,
     pub tainted_args: Vec<String>,
     pub action_hash: String,
+    /// Mandate escalate scopes that triggered this hold, each with its signed `approvers` list.
+    /// Empty when the hold came only from the default policy (e.g. `sql-dml-escalate`), from
+    /// Tier 2, or from a token issued before approvers were signed in: any non-empty name is
+    /// then accepted. The name is self-declared over the shared bearer token, so matching it
+    /// against this list is a consistency check, not authentication.
+    pub escalation_scopes: Vec<EscalationScope>,
+    #[serde(skip)]
+    mandate_id: String,
+    #[serde(skip)]
+    principal: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct EscalationScope {
+    pub tool: String,
+    pub resource: String,
+    pub approvers: Vec<String>,
+}
+
+/// Why `Engine::approve` did not issue a receipt.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApproveError {
+    /// This Edge does not hold the approval key.
+    NoApprovalKey,
+    /// No pending approval with this id.
+    NotFound,
+    /// The supplied approver name is empty.
+    EmptyName,
+    /// The hold came from a mandate escalate scope and the supplied (self-declared) name is not
+    /// one of that scope's listed approvers. Recorded in evidence; no receipt issued.
+    NotListed,
+    /// The pending approval was denied; it can no longer be approved.
+    Denied,
+}
+impl std::fmt::Display for ApproveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self:?}")
+    }
 }
 
 pub struct Config {
@@ -129,7 +168,13 @@ struct State {
     pending: HashMap<String, PendingApproval>,
     file: Option<std::fs::File>,
     counter: u64,
-    consumed: HashSet<String>,
+    /// Used receipt ids -> receipt expiry (ms). Persisted (when there is an evidence path) to
+    /// `<evidence>.consumed-receipts`, so a receipt stays single-use across restarts.
+    consumed: HashMap<String, u64>,
+    consumed_file: Option<std::fs::File>,
+    /// Escalation decision ids denied via `deny`: never approvable again, and any receipt
+    /// already issued for them is refused.
+    denied: HashSet<String>,
 }
 
 pub struct Engine {
@@ -239,6 +284,11 @@ impl Engine {
             ),
             None => None,
         };
+        let (consumed, consumed_file) = match &c.evidence_path {
+            Some(p) => consumed::open(&consumed::path_for(p), wall_ms())
+                .map_err(|e| EngineError(format!("consumed receipts file: {e}")))?,
+            None => (HashMap::new(), None),
+        };
         Ok(Self {
             root: c.root,
             tools,
@@ -257,7 +307,9 @@ impl Engine {
                 pending: HashMap::new(),
                 file,
                 counter: 0,
-                consumed: HashSet::new(),
+                consumed,
+                consumed_file,
+                denied: HashSet::new(),
             }),
             tier2: None,
             t2_export: false,
@@ -515,6 +567,8 @@ impl Engine {
         let base = constraints::baseline(&req.args, def);
         reasons.extend(base.reasons.iter().cloned());
         let mut vouched: HashSet<String> = HashSet::new();
+        // Mandate escalate scopes whose constraints did not deny (candidates for "who may approve").
+        let mut escalation_scopes: Vec<EscalationScope> = vec![];
         let purpose = verified
             .as_ref()
             .map(|v| v.purpose.clone())
@@ -527,7 +581,7 @@ impl Engine {
                 // Each matching scope grants only if its constraints pass; strictest surviving effect wins.
                 let mut best: Option<Effect> = None;
                 let ctx = bindings::merge(&v.context, req.context.as_ref(), &v.principal);
-                for (eff, c) in &v.scopes {
+                for (i, (eff, c)) in v.scopes.iter().enumerate() {
                     let c = &bindings::resolve(c, &ctx);
                     let o = constraints::eval(c, &req.args, def, &|a| tainted_any.contains(a));
                     reasons.extend(o.reasons.iter().cloned());
@@ -536,6 +590,15 @@ impl Engine {
                         constraints::Verdict::Escalate if *eff == Effect::Allow => Effect::Escalate,
                         _ => *eff,
                     };
+                    if *eff == Effect::Escalate {
+                        if let Some(m) = v.scope_meta.get(i) {
+                            escalation_scopes.push(EscalationScope {
+                                tool: req.tool.clone(),
+                                resource: m.resource.clone(),
+                                approvers: m.approvers.clone(),
+                            });
+                        }
+                    }
                     vouched.extend(o.vouched);
                     obligations.extend(o.obligations);
                     ddl_mandated |= o.ddl_ok;
@@ -551,6 +614,11 @@ impl Engine {
         if base.verdict == constraints::Verdict::Deny {
             mandate_effect = Effect::Deny;
         }
+        if mandate_effect != Effect::Escalate {
+            escalation_scopes.clear();
+        }
+        // Scopes without a signed list (old tokens) add no restriction.
+        escalation_scopes.retain(|s| !s.approvers.is_empty());
         let in_catalogue = def.is_some();
         if !in_catalogue {
             reasons.push("tool not in signed catalogue: treated as destructive".into());
@@ -704,21 +772,30 @@ impl Engine {
         // Approval receipt: can turn an escalate into allow, exactly once, for exactly this action.
         let ahash = receipts::action_hash(&mandate_id, &req.tool, &resource, &req.args);
         let mut approval: Option<String> = None;
+        let mut escalation_decision_id: Option<String> = None;
         if let Some(r) = &req.receipt {
             if decision != "escalate" {
                 reasons.push(format!("receipt ignored: a receipt can only resolve an escalation (decision is {decision})"));
             } else {
                 let mut st = self.state.lock().unwrap();
                 let res = receipts::check(r, &self.approval_vk, &ahash, wall_ms()).and_then(|_| {
-                    if st.consumed.contains(&r.apr_id) {
+                    if st.denied.contains(&r.decision_id) {
+                        Err(receipts::ReceiptError::Denied)
+                    } else if st.consumed.contains_key(&r.apr_id) {
                         Err(receipts::ReceiptError::AlreadyUsed)
                     } else {
                         Ok(())
                     }
                 });
+                // Persist the id BEFORE accepting the receipt; if that fails, refuse (fail closed).
+                let res = res.and_then(|_| {
+                    let now = wall_ms();
+                    let st = &mut *st;
+                    consumed::record(&mut st.consumed, st.consumed_file.as_mut(), r, now)
+                        .map_err(|_| receipts::ReceiptError::NotPersisted)
+                });
                 match res {
                     Ok(()) => {
-                        st.consumed.insert(r.apr_id.clone());
                         decision = "allow".into();
                         policy_ids.push("approval-receipt".into());
                         reasons.push(format!(
@@ -727,6 +804,9 @@ impl Engine {
                         ));
                         approval =
                             Some(hex::encode(Sha256::digest(serde_json::to_vec(r).unwrap())));
+                        // Signed into the receipt by the approval key: links this allow record to
+                        // the escalation record it resolves.
+                        escalation_decision_id = Some(r.decision_id.clone());
                     }
                     Err(e) => reasons.push(format!("receipt rejected: {e:?}")),
                 }
@@ -753,12 +833,11 @@ impl Engine {
             policy_ids: policy_ids.clone(),
             reasons: reasons.clone(),
             approval: approval.clone(),
+            escalation_decision_id,
         });
         let (seq, entry_hash) = (e.seq, e.entry_hash.clone());
         let line = serde_json::to_string(e).unwrap();
-        if let Some(f) = st.file.as_mut() {
-            let _ = writeln!(f, "{line}").and_then(|_| f.flush());
-        }
+        write_line(&mut st, &line);
         if decision == "allow" || !enforced {
             st.ran
                 .insert(decision_id.clone(), (skey.clone(), req.tool.clone()));
@@ -780,6 +859,9 @@ impl Engine {
                     reasons: reasons.clone(),
                     tainted_args: tainted_args.clone(),
                     action_hash: ahash,
+                    escalation_scopes,
+                    mandate_id: mandate_id.clone(),
+                    principal: principal.clone(),
                 },
             );
             Some(format!("{}/v1/approvals/{}", self.edge_url, decision_id))
@@ -804,20 +886,57 @@ impl Engine {
 
     /// Approval service (in the MVP the Edge hosts it; in production the control plane signs with
     /// the tenant approval key). Issues a signed, single-use receipt bound to the pending action.
+    ///
+    /// `approver` is SELF-DECLARED: the caller holds the one shared approver bearer token and
+    /// types a name. If the hold came from a mandate escalate scope, the name must exactly match
+    /// one of that scope's signed `approvers` (every such scope, if several matched); otherwise
+    /// the attempt is refused with an evidence record and no receipt. This is a consistency check
+    /// between the mandate and the receipt, NOT authentication of the person approving.
     pub fn approve(
         &self,
         decision_id: &str,
         approver: &str,
-    ) -> Result<receipts::Receipt, EngineError> {
+    ) -> Result<receipts::Receipt, ApproveError> {
         let sk = self
             .approval_sk
             .as_ref()
-            .ok_or_else(|| EngineError("this Edge has no approval key".into()))?;
-        let st = self.state.lock().unwrap();
+            .ok_or(ApproveError::NoApprovalKey)?;
+        let mut st = self.state.lock().unwrap();
+        if st.denied.contains(decision_id) {
+            return Err(ApproveError::Denied);
+        }
         let p = st
             .pending
             .get(decision_id)
-            .ok_or_else(|| EngineError("no such pending approval".into()))?;
+            .cloned()
+            .ok_or(ApproveError::NotFound)?;
+        if approver.trim().is_empty() {
+            return Err(ApproveError::EmptyName);
+        }
+        let not_listed: Vec<&EscalationScope> = p
+            .escalation_scopes
+            .iter()
+            .filter(|s| !s.approvers.iter().any(|a| a == approver))
+            .collect();
+        if !not_listed.is_empty() {
+            let reasons = not_listed
+                .iter()
+                .map(|s| {
+                    format!(
+                        "approval refused: self-declared approver {approver:?} is not in the approvers list {:?} of mandate escalate scope {} {} (escalation {decision_id}; no receipt issued; name not authenticated)",
+                        s.approvers, s.tool, s.resource
+                    )
+                })
+                .collect();
+            self.record_approval_event(
+                &mut st,
+                &p,
+                "deny",
+                vec!["approval-refused-approver-not-listed".into()],
+                reasons,
+            );
+            return Err(ApproveError::NotListed);
+        }
         let now = wall_ms();
         let r = receipts::Receipt {
             spec: "sentryra.approval-receipt/v0".into(),
@@ -830,6 +949,85 @@ impl Engine {
             sig: String::new(),
         };
         Ok(receipts::sign(r, sk))
+    }
+
+    /// Deny a pending escalation. `approver` is SELF-DECLARED (shared bearer token), like in
+    /// `approve`; any non-empty name may deny. Removes the pending approval, writes a signed
+    /// evidence record (decision `deny`, policy `approval-denied`) naming the self-declared denier
+    /// and the optional reason, and makes later approves of this id fail. The agent's retry has
+    /// no receipt, so it is held again as a new escalation.
+    pub fn deny(
+        &self,
+        decision_id: &str,
+        approver: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ApproveError> {
+        let mut st = self.state.lock().unwrap();
+        if st.denied.contains(decision_id) {
+            return Err(ApproveError::Denied);
+        }
+        let p = st
+            .pending
+            .get(decision_id)
+            .cloned()
+            .ok_or(ApproveError::NotFound)?;
+        if approver.trim().is_empty() {
+            return Err(ApproveError::EmptyName);
+        }
+        let reason: String = reason
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("(none given)")
+            .chars()
+            .take(500)
+            .collect();
+        st.pending.remove(decision_id);
+        st.denied.insert(decision_id.to_string());
+        self.record_approval_event(
+            &mut st,
+            &p,
+            "deny",
+            vec!["approval-denied".into()],
+            vec![format!(
+                "approval denied by self-declared approver {approver:?} (name not authenticated); escalation {decision_id}; reason: {reason}"
+            )],
+        );
+        Ok(())
+    }
+
+    /// Append an evidence record about an approval-service event (refusal, denial) for a pending
+    /// escalation. Raw args are HMAC'd like every other entry.
+    fn record_approval_event(
+        &self,
+        st: &mut State,
+        p: &PendingApproval,
+        decision: &str,
+        policy_ids: Vec<String>,
+        reasons: Vec<String>,
+    ) {
+        let ts_ms = wall_ms();
+        st.counter += 1;
+        let id = format!("dec_{:016x}{:04x}", ts_ms, st.counter);
+        let enforced = self.mode == Mode::Enforce;
+        let e = st.chain.append(NewEntry {
+            ts_ms,
+            decision_id: &id,
+            mandate_id: &p.mandate_id,
+            tool: &p.tool,
+            resource: &p.resource,
+            args: &p.args,
+            principal: &p.principal,
+            tainted: !p.tainted_args.is_empty(),
+            decision,
+            mode: if enforced { "enforce" } else { "shadow" },
+            enforced,
+            policy_ids,
+            reasons,
+            approval: None,
+            escalation_decision_id: Some(p.decision_id.clone()),
+        });
+        let line = serde_json::to_string(e).unwrap();
+        write_line(st, &line);
     }
 
     fn cedar(
@@ -890,6 +1088,12 @@ impl Engine {
             }
         };
         (d.into(), ids)
+    }
+}
+
+fn write_line(st: &mut State, line: &str) {
+    if let Some(f) = st.file.as_mut() {
+        let _ = writeln!(f, "{line}").and_then(|_| f.flush());
     }
 }
 

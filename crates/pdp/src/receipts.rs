@@ -46,6 +46,11 @@ pub enum ReceiptError {
     WrongAction,
     Expired,
     AlreadyUsed,
+    /// The escalation this receipt resolves was denied after the receipt was issued.
+    Denied,
+    /// The used-receipt id could not be written to disk; refused rather than risk a replay
+    /// after restart.
+    NotPersisted,
 }
 
 /// Checks signature, binding and expiry. Single use is enforced by the caller's consumed set.

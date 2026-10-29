@@ -118,14 +118,17 @@ Each decision carries `reasons` and `policy_ids`. Tier 2 is escalate-only: it ne
 
 1. The agent gets `pending approval, decision <id>` and an approver link `https://<edge>/v1/approvals/<id>`.
 2. The approver opens it with `Authorization: Bearer <approver.token>`. The link shows tool, resource, args and reasons, and is served only by your Edge.
-3. To approve: `POST /v1/approvals/<id>/approve {"approver": "name@company"}`. This returns a signed receipt.
-4. The agent retries the same call with the receipt in `_meta.com.sentryra/receipt` (MCP) or `receipt` (HTTP). The receipt is single-use and bound to the action hash: a different argument or a replay is refused.
+3. To approve: `POST /v1/approvals/<id>/approve {"approver": "name@company"}`. This returns a signed receipt. The name is self-declared (anyone with the token can type any name). If the hold came from a mandate escalate scope, the name must exactly match one of that scope's `approvers`, or the Edge returns 403, issues no receipt and records the refusal in evidence. Holds from the default policy (e.g. SQL DML) accept any non-empty name.
+4. To deny: `POST /v1/approvals/<id>/deny {"approver": "name@company", "reason": "optional"}` (same token). The Edge drops the pending approval, records the denial (self-declared name and reason) in evidence, and refuses any later approve of that id or any receipt already issued for it (the denied list is held in memory only: if the Edge restarts, a receipt issued before the denial is accepted again until it expires, 10 minutes after issue). The agent's retry is held again as a new escalation.
+5. The agent retries the same call with the receipt in `_meta.com.sentryra/receipt` (MCP) or `receipt` (HTTP). The receipt is single-use and bound to the action hash: a different argument or a replay is refused. Used receipt ids are kept in `/data/evidence.jsonl.consumed-receipts` (next to the evidence log), so a replay is refused after a restart too; if that file cannot be written, the receipt is refused.
 
 ## 6. Export the evidence log
 
 - **File:** copy `/data/evidence.jsonl` (append-only, hash-chained, Ed25519-signed).
 - **HTTP:** `GET /v1/evidence` with `Authorization: Bearer <approver.token>`.
 - **Verify offline:** `sentryra-verify evidence.jsonl /keys/evidence.pub`. In the image: `podman run --rm --entrypoint /sentryra-verify -v …:/data -v …:/keys sentryra-edge:0.0.1 /data/evidence.jsonl /keys/evidence.pub`.
+
+The allow record of an approved retry has `escalation_decision_id` set to the held call's `decision_id`, and `approval` set to the receipt's SHA-256; refusals and denials also carry `escalation_decision_id`.
 
 Entries hold salted digests of arguments, never raw secrets in the clear. Share `evidence.pub` with your auditors.
 

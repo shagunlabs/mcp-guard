@@ -1,0 +1,3 @@
+[advisories]
+# Keep in sync with deny.toml. See the comment there for why each id is ignored and when to remove it.
+ignore = ["RUSTSEC-2026-0387"]

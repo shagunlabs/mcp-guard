@@ -96,6 +96,20 @@ pub fn issue(m: &Mandate, root: &KeyPair) -> Result<Biscuit, TokenError> {
             q(eff(s.effect)),
             q(&c)
         ));
+        // The scope's `approvers` list is signed into the authority block next to the scope (a
+        // separate fact, so tokens issued before this fact existed still verify unchanged).
+        // These names are only compared with the self-declared name in an approve request:
+        // a consistency check, not authentication of the approver.
+        if !s.approvers.is_empty() {
+            code.push_str(&format!(
+                "scope_approvers({}, {}, {}, {}, {});\n",
+                q(&s.tool),
+                q(&s.resource),
+                q(eff(s.effect)),
+                q(&c),
+                q(&serde_json::to_string(&s.approvers).unwrap())
+            ));
+        }
     }
     Ok(Biscuit::builder().code(code)?.build(root)?)
 }
@@ -169,6 +183,15 @@ pub struct Verified {
     pub effect: Effect,
     /// Every matching scope as (effect, constraints JSON). Constraints are part of the signed authority block.
     pub scopes: Vec<(Effect, serde_json::Value)>,
+    /// Per matching scope (same order as `scopes`): its resource pattern and its signed
+    /// `approvers` list (empty if the scope has none, or the token predates `scope_approvers`).
+    pub scope_meta: Vec<ScopeMeta>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeMeta {
+    pub resource: String,
+    pub approvers: Vec<String>,
 }
 
 /// Verify signature, revocation, expiry and attenuation checks for one action; return the mandate effect.
@@ -209,11 +232,40 @@ pub fn verify(
     // `**` across segments. Matching happens here, over scopes from the signed authority block.
     let all: Vec<(String, String, String)> =
         a.query(format!("e($r, $e, $c) <- scope({}, $r, $e, $c)", q(tool)).as_str())?;
-    let rows: Vec<(String, String)> = all
+    let rows: Vec<(String, String, String)> = all
         .into_iter()
         .filter(|(r, _, _)| resource_matches(r, resource))
-        .map(|(_, e, c)| (e, c))
         .collect();
+    let apr: Vec<(String, String, String, String)> = a.query(
+        format!(
+            "x($r, $e, $c, $a) <- scope_approvers({}, $r, $e, $c, $a)",
+            q(tool)
+        )
+        .as_str(),
+    )?;
+    let mut scope_meta = Vec::with_capacity(rows.len());
+    for (r, e, c) in &rows {
+        let mut approvers: Vec<String> = vec![];
+        for (_, _, _, l) in apr
+            .iter()
+            .filter(|(ar, ae, ac, _)| ar == r && ae == e && ac == c)
+        {
+            let l: Vec<String> = serde_json::from_str(l).map_err(|_| {
+                TokenError::Biscuit("scope_approvers: not a JSON string list".into())
+            })?;
+            if l.is_empty() || l.iter().any(|x| x.trim().is_empty()) {
+                return Err(TokenError::Biscuit(
+                    "scope_approvers: empty list or empty name".into(),
+                ));
+            }
+            approvers.extend(l);
+        }
+        approvers.dedup();
+        scope_meta.push(ScopeMeta {
+            resource: r.clone(),
+            approvers,
+        });
+    }
     let to_eff = |e: &str| match e {
         "allow" => Effect::Allow,
         "escalate" => Effect::Escalate,
@@ -221,7 +273,7 @@ pub fn verify(
     };
     let scopes: Vec<(Effect, serde_json::Value)> = rows
         .iter()
-        .map(|(e, c)| {
+        .map(|(_, e, c)| {
             (
                 to_eff(e),
                 serde_json::from_str(c).unwrap_or(serde_json::Value::Null),
@@ -245,6 +297,7 @@ pub fn verify(
         context: serde_json::from_str(&one("c($c) <- context($c)", &mut a)?).unwrap_or_default(),
         effect,
         scopes,
+        scope_meta,
     })
 }
 
@@ -294,6 +347,41 @@ mod tests {
                 .effect,
             Effect::Deny
         );
+    }
+    #[test]
+    fn approvers_are_signed_into_the_token() {
+        let (root, t) = setup();
+        let r = v(&t, &root, "k8s.apply", "cluster:prod/ns:billing", NOW).unwrap();
+        let m = Mandate::from_json(EX).unwrap();
+        let want = &m
+            .scopes
+            .iter()
+            .find(|s| s.effect == Effect::Escalate && s.tool == "k8s.apply")
+            .unwrap()
+            .approvers;
+        assert!(!want.is_empty());
+        let i = r
+            .scopes
+            .iter()
+            .position(|s| s.0 == Effect::Escalate)
+            .unwrap();
+        assert_eq!(&r.scope_meta[i].approvers, want);
+        // a scope without approvers carries an empty list
+        let s = v(&t, &root, "k8s.apply", "cluster:staging/ns:billing", NOW).unwrap();
+        assert!(s.scope_meta.iter().all(|m| m.approvers.is_empty()));
+    }
+    #[test]
+    fn token_without_scope_approvers_still_verifies() {
+        // Same authority block as an older issuer produced (no scope_approvers fact).
+        let root = KeyPair::new();
+        let code =
+            "mandate(\"m\"); tenant(\"t\"); principal(\"p\"); agent(\"a\"); purpose(\"x\");\n\
+                    scope(\"k8s.apply\", \"cluster:prod\", \"escalate\", \"{}\");\n";
+        let t = Biscuit::builder().code(code).unwrap().build(&root).unwrap();
+        let r = v(&t, &root, "k8s.apply", "cluster:prod", NOW).unwrap();
+        assert_eq!(r.effect, Effect::Escalate);
+        assert_eq!(r.scope_meta.len(), 1);
+        assert!(r.scope_meta[0].approvers.is_empty());
     }
     #[test]
     fn resource_globs() {

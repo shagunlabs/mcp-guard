@@ -4,7 +4,7 @@ Example: `examples/mandate-v0.json`.
 ## Required fields
 `mandate_id`, `spec` (= `sentryra.mandate/v0`), `tenant`, `principal`, `agent` (incl. `cnf` key binding), `purpose` (captured from the principal at consent, never from agent context), `scopes[]`, `default_effect` (MUST be `deny`), `not_before`, `expires_at`.
 ## Scopes
-Each scope: `tool`, `resource`, `effect` ∈ {allow, escalate, deny}, `approvers` (REQUIRED when `escalate`), optional `constraints`. When several scopes match, strictest wins (deny > escalate > allow). No match → `default_effect`.
+Each scope: `tool`, `resource`, `effect` ∈ {allow, escalate, deny}, `approvers` (REQUIRED when `escalate`), optional `constraints`. The issuer signs `approvers` into the token (`scope_approvers` fact); tokens without it still verify and then carry no list. On approve, a hold from an escalate scope requires the self-declared approver name to match one listed entry exactly (a consistency check, not authentication). When several scopes match, strictest wins (deny > escalate > allow). No match → `default_effect`.
 ## Constraint vocabulary (v0)
 Scope `constraints` use these dotted keys (adopted from the ML team's bench v0.2 schema). Tier 1 evaluates them deterministically against call arguments, using the connector manifest's argument kinds (`args`) or the listed default argument names. A scope grants only if **all** its constraints pass. A failed constraint denies. **Unknown keys escalate** (fail closed, never ignored). Values starting with `$` are context bindings (e.g. `$ticket.requester`). The v0 Edge can't resolve them yet, so a call that touches the bound argument escalates.
 

@@ -22,7 +22,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
                                                 when the spec has ticket.requester; context values are never printed)
   attenuate <keydir> <token> <tool> <resource> [expires_at]
   revocation-ids <keydir> <token>
-  serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, GET /v1/evidence
+  serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, POST .../approve|deny, GET /v1/evidence
   mcp-proxy <keydir> [opts] -- <server cmd...>  stdio MCP proxy (mandate from $SENTRYRA_MANDATE, trusted host context JSON from $SENTRYRA_CONTEXT)
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
@@ -642,6 +642,12 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
     struct Approve {
         approver: String,
     }
+    #[derive(serde::Deserialize)]
+    struct Deny {
+        approver: String,
+        #[serde(default)]
+        reason: Option<String>,
+    }
     let st = S {
         e: e.clone(),
         token: Arc::new(approver_token),
@@ -678,9 +684,34 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
                             if !authed(&h, &s.token) {
                                 return Err(StatusCode::UNAUTHORIZED);
                             }
-                            s.e.approve(&id, &a.approver)
-                                .map(Json)
-                                .map_err(|_| StatusCode::NOT_FOUND)
+                            // The name is self-declared (shared token); see Engine::approve.
+                            s.e.approve(&id, &a.approver).map(Json).map_err(|e| match e {
+                                sentryra_pdp::ApproveError::NotListed => StatusCode::FORBIDDEN,
+                                sentryra_pdp::ApproveError::EmptyName => StatusCode::BAD_REQUEST,
+                                sentryra_pdp::ApproveError::Denied => StatusCode::CONFLICT,
+                                _ => StatusCode::NOT_FOUND,
+                            })
+                        },
+                    ),
+                )
+                // Deny a held call (same shared bearer token; the name is self-declared).
+                .route(
+                    "/v1/approvals/{id}/deny",
+                    post(
+                        |State(s): State<S>,
+                         h: HeaderMap,
+                         P(id): P<String>,
+                         Json(d): Json<Deny>| async move {
+                            if !authed(&h, &s.token) {
+                                return Err(StatusCode::UNAUTHORIZED);
+                            }
+                            s.e.deny(&id, &d.approver, d.reason.as_deref())
+                                .map(|_| StatusCode::NO_CONTENT)
+                                .map_err(|e| match e {
+                                    sentryra_pdp::ApproveError::EmptyName => StatusCode::BAD_REQUEST,
+                                    sentryra_pdp::ApproveError::Denied => StatusCode::CONFLICT,
+                                    _ => StatusCode::NOT_FOUND,
+                                })
                         },
                     ),
                 )
@@ -733,4 +764,117 @@ fn serve(e: Arc<Engine>, addr: String, approver_token: String, ingest_token: Opt
         );
         axum::serve(l, app).await.unwrap();
     });
+}
+
+#[cfg(test)]
+mod http_tests {
+    use super::*;
+    use std::io::{Read, Write};
+
+    const NOW: &str = "2026-10-07T13:00:00Z";
+    const TOK: &str = "test-approver-token-0123456789abcdef";
+
+    /// Engine + Edge router on 127.0.0.1:<random>, plus a mandate with a `group:sre` escalate scope.
+    fn start() -> (Arc<Engine>, String, String) {
+        let root = KeyPair::new();
+        let cat = SigningKey::from_bytes(&[3u8; 32]);
+        let man = include_bytes!("../../spec/examples/connector-demo-db.json").to_vec();
+        let sig = hex::encode(cat.sign(&man).to_bytes());
+        let e = Arc::new(
+            Engine::new(Config {
+                root: root.public(),
+                catalogue_key: cat.verifying_key(),
+                manifests: vec![(man, sig)],
+                policies: DEFAULT_POLICIES.into(),
+                evidence_key: SigningKey::from_bytes(&[4u8; 32]),
+                salt_key: b"k".to_vec(),
+                mode: Mode::Enforce,
+                evidence_path: None,
+                edge_url: "http://edge".into(),
+                revoked: Default::default(),
+                approval_vk: SigningKey::from_bytes(&[7u8; 32]).verifying_key(),
+                approval_sk: Some(SigningKey::from_bytes(&[7u8; 32])),
+            })
+            .unwrap(),
+        );
+        let m = serde_json::json!({
+            "mandate_id": "mdt_http", "spec": "sentryra.mandate/v0", "tenant": "org_acme",
+            "principal": {"id": "priya@acme.com"}, "agent": {"id": "agt_test"}, "purpose": "test",
+            "scopes": [
+                {"tool": "db.query", "resource": "db:demo", "effect": "allow"},
+                {"tool": "k8s.apply", "resource": "cluster:prod", "effect": "escalate", "approvers": ["group:sre"]}
+            ],
+            "default_effect": "deny", "not_before": "2026-10-07T12:00:00Z", "expires_at": "2026-10-07T20:00:00Z"
+        });
+        let tok = token::issue(&Mandate::from_json(&m.to_string()).unwrap(), &root)
+            .unwrap()
+            .to_base64()
+            .unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let app = router(e.clone(), TOK.into(), None);
+        std::thread::spawn(move || {
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(async move {
+                    let l = tokio::net::TcpListener::from_std(l).unwrap();
+                    axum::serve(l, app).await.unwrap();
+                })
+        });
+        (e, tok, addr)
+    }
+
+    /// Minimal HTTP/1.1 POST; returns the status code.
+    fn post(addr: &str, path: &str, body: &str, auth: bool) -> u16 {
+        let mut s = std::net::TcpStream::connect(addr).unwrap();
+        let a = if auth {
+            format!("Authorization: Bearer {TOK}\r\n")
+        } else {
+            String::new()
+        };
+        write!(s, "POST {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n{a}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut r = String::new();
+        s.read_to_string(&mut r).unwrap();
+        r[9..12].parse().unwrap()
+    }
+
+    fn hold(e: &Engine, tok: &str, tool: &str, args: serde_json::Value) -> String {
+        let r = e.decide(&DecideRequest {
+            mandate: tok.into(),
+            tool: tool.into(),
+            args,
+            now: Some(NOW.into()),
+            receipt: None,
+            context: None,
+        });
+        assert_eq!(r.decision, "escalate", "{:?}", r.reasons);
+        r.decision_id
+    }
+
+    #[test]
+    fn approve_and_deny_status_codes() {
+        let (e, tok, addr) = start();
+        let k8s = serde_json::json!({"resource": "cluster:prod", "manifest": "x"});
+        let id = hold(&e, &tok, "k8s.apply", k8s.clone());
+        let ap = format!("/v1/approvals/{id}/approve");
+        let dn = format!("/v1/approvals/{id}/deny");
+        // approve: 400 empty name, 403 name not in the scope's approvers list
+        assert_eq!(post(&addr, &ap, r#"{"approver":" "}"#, true), 400);
+        assert_eq!(post(&addr, &ap, r#"{"approver":"mallory"}"#, true), 403);
+        // deny: 401 no token, 400 empty name, 404 unknown id, 204 ok, 409 already denied
+        assert_eq!(post(&addr, &dn, r#"{"approver":"lead"}"#, false), 401);
+        assert_eq!(post(&addr, &dn, r#"{"approver":""}"#, true), 400);
+        let nope = "/v1/approvals/dec_nope/deny";
+        assert_eq!(post(&addr, nope, r#"{"approver":"lead"}"#, true), 404);
+        let body = r#"{"approver":"lead","reason":"freeze"}"#;
+        assert_eq!(post(&addr, &dn, body, true), 204);
+        assert_eq!(post(&addr, &dn, body, true), 409);
+        // approve after deny: 409
+        assert_eq!(post(&addr, &ap, r#"{"approver":"group:sre"}"#, true), 409);
+        // a fresh hold approved by a listed name: 200
+        let id2 = hold(&e, &tok, "k8s.apply", k8s);
+        let ap2 = format!("/v1/approvals/{id2}/approve");
+        assert_eq!(post(&addr, &ap2, r#"{"approver":"group:sre"}"#, true), 200);
+    }
 }
