@@ -1435,3 +1435,56 @@ fn mail_recipient_domains_fail_closed() {
     ));
     assert_eq!(r.decision, "deny", "{:?}", r.reasons);
 }
+
+#[test]
+fn approve_checks_mandate_scope_approvers() {
+    let (e, t, _) = engine(Mode::Enforce);
+    let args = serde_json::json!({"resource": "cluster:prod", "manifest": "x"});
+    let r1 = e.decide(&req(&t, "k8s.apply", args.clone()));
+    assert_eq!(r1.decision, "escalate", "{:?}", r1.reasons);
+    let p = e.pending(&r1.decision_id).unwrap();
+    assert_eq!(p.escalation_scopes.len(), 1);
+    assert_eq!(
+        p.escalation_scopes[0].approvers,
+        vec!["group:sre".to_string()]
+    );
+    let n = e.entries().len();
+    // not listed: refused, no receipt, one evidence record
+    assert_eq!(
+        e.approve(&r1.decision_id, "mallory@acme.example"),
+        Err(ApproveError::NotListed)
+    );
+    let es = e.entries();
+    assert_eq!(es.len(), n + 1);
+    let last = es.last().unwrap();
+    assert_eq!(last.decision, "deny");
+    assert!(last.reasons[0].contains("self-declared"));
+    assert!(sentryra_evidence::verify(&es, None).is_ok());
+    assert_eq!(
+        e.approve(&r1.decision_id, " "),
+        Err(ApproveError::EmptyName)
+    );
+    // listed (exact match): receipt issued and accepted once
+    let rc = e.approve(&r1.decision_id, "group:sre").unwrap();
+    let mut ok = req(&t, "k8s.apply", args);
+    ok.receipt = Some(rc);
+    assert_eq!(e.decide(&ok).decision, "allow");
+}
+
+#[test]
+fn default_policy_escalation_accepts_any_non_empty_name() {
+    let (e, t, _) = engine(Mode::Enforce);
+    let r1 = e.decide(&req(
+        &t,
+        "db.query",
+        serde_json::json!({"db": "demo", "sql": "DELETE FROM users WHERE id = 3"}),
+    ));
+    assert_eq!(r1.decision, "escalate");
+    assert!(e
+        .pending(&r1.decision_id)
+        .unwrap()
+        .escalation_scopes
+        .is_empty());
+    assert!(e.approve(&r1.decision_id, "anyone").is_ok());
+    assert_eq!(e.approve("dec_nope", "anyone"), Err(ApproveError::NotFound));
+}

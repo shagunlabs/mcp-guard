@@ -118,7 +118,7 @@ Each decision carries `reasons` and `policy_ids`. Tier 2 is escalate-only: it ne
 
 1. The agent gets `pending approval, decision <id>` and an approver link `https://<edge>/v1/approvals/<id>`.
 2. The approver opens it with `Authorization: Bearer <approver.token>`. The link shows tool, resource, args and reasons, and is served only by your Edge.
-3. To approve: `POST /v1/approvals/<id>/approve {"approver": "name@company"}`. This returns a signed receipt.
+3. To approve: `POST /v1/approvals/<id>/approve {"approver": "name@company"}`. This returns a signed receipt. The name is self-declared (anyone with the token can type any name). If the hold came from a mandate escalate scope, the name must exactly match one of that scope's `approvers`, or the Edge returns 403, issues no receipt and records the refusal in evidence. Holds from the default policy (e.g. SQL DML) accept any non-empty name.
 4. The agent retries the same call with the receipt in `_meta.com.sentryra/receipt` (MCP) or `receipt` (HTTP). The receipt is single-use and bound to the action hash: a different argument or a replay is refused.
 
 ## 6. Export the evidence log

@@ -678,9 +678,12 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
                             if !authed(&h, &s.token) {
                                 return Err(StatusCode::UNAUTHORIZED);
                             }
-                            s.e.approve(&id, &a.approver)
-                                .map(Json)
-                                .map_err(|_| StatusCode::NOT_FOUND)
+                            // The name is self-declared (shared token); see Engine::approve.
+                            s.e.approve(&id, &a.approver).map(Json).map_err(|e| match e {
+                                sentryra_pdp::ApproveError::NotListed => StatusCode::FORBIDDEN,
+                                sentryra_pdp::ApproveError::EmptyName => StatusCode::BAD_REQUEST,
+                                _ => StatusCode::NOT_FOUND,
+                            })
                         },
                     ),
                 )
