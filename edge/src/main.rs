@@ -22,7 +22,7 @@ const USAGE: &str = "usage: sentryra-edge <command>
                                                 when the spec has ticket.requester; context values are never printed)
   attenuate <keydir> <token> <tool> <resource> [expires_at]
   revocation-ids <keydir> <token>
-  serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, GET /v1/evidence
+  serve <keydir> [opts] [--addr 127.0.0.1:8787] HTTP: POST /v1/decide, GET /v1/approvals/<id>, POST .../approve|deny, GET /v1/evidence
   mcp-proxy <keydir> [opts] -- <server cmd...>  stdio MCP proxy (mandate from $SENTRYRA_MANDATE, trusted host context JSON from $SENTRYRA_CONTEXT)
   bench <keydir> [opts] [--n 20000]             in-process Tier 1 latency
   doctor [--no-network] [--home <dir>]          scan agent environment for standing credentials and egress
@@ -642,6 +642,12 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
     struct Approve {
         approver: String,
     }
+    #[derive(serde::Deserialize)]
+    struct Deny {
+        approver: String,
+        #[serde(default)]
+        reason: Option<String>,
+    }
     let st = S {
         e: e.clone(),
         token: Arc::new(approver_token),
@@ -682,8 +688,30 @@ fn router(e: Arc<Engine>, approver_token: String, ingest_token: Option<String>) 
                             s.e.approve(&id, &a.approver).map(Json).map_err(|e| match e {
                                 sentryra_pdp::ApproveError::NotListed => StatusCode::FORBIDDEN,
                                 sentryra_pdp::ApproveError::EmptyName => StatusCode::BAD_REQUEST,
+                                sentryra_pdp::ApproveError::Denied => StatusCode::CONFLICT,
                                 _ => StatusCode::NOT_FOUND,
                             })
+                        },
+                    ),
+                )
+                // Deny a held call (same shared bearer token; the name is self-declared).
+                .route(
+                    "/v1/approvals/{id}/deny",
+                    post(
+                        |State(s): State<S>,
+                         h: HeaderMap,
+                         P(id): P<String>,
+                         Json(d): Json<Deny>| async move {
+                            if !authed(&h, &s.token) {
+                                return Err(StatusCode::UNAUTHORIZED);
+                            }
+                            s.e.deny(&id, &d.approver, d.reason.as_deref())
+                                .map(|_| StatusCode::NO_CONTENT)
+                                .map_err(|e| match e {
+                                    sentryra_pdp::ApproveError::EmptyName => StatusCode::BAD_REQUEST,
+                                    sentryra_pdp::ApproveError::Denied => StatusCode::CONFLICT,
+                                    _ => StatusCode::NOT_FOUND,
+                                })
                         },
                     ),
                 )

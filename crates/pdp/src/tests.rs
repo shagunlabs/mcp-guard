@@ -1488,3 +1488,48 @@ fn default_policy_escalation_accepts_any_non_empty_name() {
     assert!(e.approve(&r1.decision_id, "anyone").is_ok());
     assert_eq!(e.approve("dec_nope", "anyone"), Err(ApproveError::NotFound));
 }
+
+#[test]
+fn deny_records_evidence_and_blocks_approve_and_receipts() {
+    let (e, t, _) = engine(Mode::Enforce);
+    let args = serde_json::json!({"db": "demo", "sql": "DELETE FROM users WHERE id = 4"});
+    let r1 = e.decide(&req(&t, "db.query", args.clone()));
+    assert_eq!(r1.decision, "escalate");
+    // a receipt issued before the deny must not work afterwards
+    let early = e.approve(&r1.decision_id, "sre").unwrap();
+    assert_eq!(
+        e.deny(&r1.decision_id, "", None),
+        Err(ApproveError::EmptyName)
+    );
+    e.deny(
+        &r1.decision_id,
+        "lead@acme.example",
+        Some("not during freeze"),
+    )
+    .unwrap();
+    let last = e.entries().last().unwrap().clone();
+    assert_eq!(last.decision, "deny");
+    assert_eq!(last.policy_ids, vec!["approval-denied".to_string()]);
+    assert!(last.reasons[0].contains("self-declared") && last.reasons[0].contains("freeze"));
+    assert!(sentryra_evidence::verify(&e.entries(), None).is_ok());
+    assert!(e.pending(&r1.decision_id).is_none());
+    assert_eq!(e.approve(&r1.decision_id, "sre"), Err(ApproveError::Denied));
+    assert_eq!(
+        e.deny(&r1.decision_id, "x", None),
+        Err(ApproveError::Denied)
+    );
+    // agent retry without a receipt: held again; with the early receipt: refused
+    assert_eq!(
+        e.decide(&req(&t, "db.query", args.clone())).decision,
+        "escalate"
+    );
+    let mut x = req(&t, "db.query", args);
+    x.receipt = Some(early);
+    let r = e.decide(&x);
+    assert_eq!(r.decision, "escalate");
+    assert!(
+        r.reasons.iter().any(|s| s.contains("Denied")),
+        "{:?}",
+        r.reasons
+    );
+}

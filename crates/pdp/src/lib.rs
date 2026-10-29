@@ -129,6 +129,8 @@ pub enum ApproveError {
     /// The hold came from a mandate escalate scope and the supplied (self-declared) name is not
     /// one of that scope's listed approvers. Recorded in evidence; no receipt issued.
     NotListed,
+    /// The pending approval was denied; it can no longer be approved.
+    Denied,
 }
 impl std::fmt::Display for ApproveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -166,6 +168,9 @@ struct State {
     file: Option<std::fs::File>,
     counter: u64,
     consumed: HashSet<String>,
+    /// Escalation decision ids denied via `deny`: never approvable again, and any receipt
+    /// already issued for them is refused.
+    denied: HashSet<String>,
 }
 
 pub struct Engine {
@@ -294,6 +299,7 @@ impl Engine {
                 file,
                 counter: 0,
                 consumed: HashSet::new(),
+                denied: HashSet::new(),
             }),
             tier2: None,
             t2_export: false,
@@ -762,7 +768,9 @@ impl Engine {
             } else {
                 let mut st = self.state.lock().unwrap();
                 let res = receipts::check(r, &self.approval_vk, &ahash, wall_ms()).and_then(|_| {
-                    if st.consumed.contains(&r.apr_id) {
+                    if st.denied.contains(&r.decision_id) {
+                        Err(receipts::ReceiptError::Denied)
+                    } else if st.consumed.contains(&r.apr_id) {
                         Err(receipts::ReceiptError::AlreadyUsed)
                     } else {
                         Ok(())
@@ -873,6 +881,9 @@ impl Engine {
             .as_ref()
             .ok_or(ApproveError::NoApprovalKey)?;
         let mut st = self.state.lock().unwrap();
+        if st.denied.contains(decision_id) {
+            return Err(ApproveError::Denied);
+        }
         let p = st
             .pending
             .get(decision_id)
@@ -917,6 +928,50 @@ impl Engine {
             sig: String::new(),
         };
         Ok(receipts::sign(r, sk))
+    }
+
+    /// Deny a pending escalation. `approver` is SELF-DECLARED (shared bearer token), like in
+    /// `approve`; any non-empty name may deny. Removes the pending approval, writes a signed
+    /// evidence record (decision `deny`, policy `approval-denied`) naming the self-declared denier
+    /// and the optional reason, and makes later approves of this id fail. The agent's retry has
+    /// no receipt, so it is held again as a new escalation.
+    pub fn deny(
+        &self,
+        decision_id: &str,
+        approver: &str,
+        reason: Option<&str>,
+    ) -> Result<(), ApproveError> {
+        let mut st = self.state.lock().unwrap();
+        if st.denied.contains(decision_id) {
+            return Err(ApproveError::Denied);
+        }
+        let p = st
+            .pending
+            .get(decision_id)
+            .cloned()
+            .ok_or(ApproveError::NotFound)?;
+        if approver.trim().is_empty() {
+            return Err(ApproveError::EmptyName);
+        }
+        let reason: String = reason
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .unwrap_or("(none given)")
+            .chars()
+            .take(500)
+            .collect();
+        st.pending.remove(decision_id);
+        st.denied.insert(decision_id.to_string());
+        self.record_approval_event(
+            &mut st,
+            &p,
+            "deny",
+            vec!["approval-denied".into()],
+            vec![format!(
+                "approval denied by self-declared approver {approver:?} (name not authenticated); escalation {decision_id}; reason: {reason}"
+            )],
+        );
+        Ok(())
     }
 
     /// Append an evidence record about an approval-service event (refusal, denial) for a pending
