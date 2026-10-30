@@ -12,8 +12,17 @@ jobs:
         with: { persist-credentials: false }
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable (2026-10-14)
         with: { toolchain: stable, components: "rustfmt, clippy" }
-      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc  # noamx shim build (deploy/noamx/build.sh)
-      - run: make noamx  # builds + sha256-checks the shim used by edge t2_amx tests
+      # noamx shim: build.sh output is byte-identical only for the toolchain the pin was made with
+      # (gcc 14.2.0-19, binutils 2.44-3, Debian trixie). The runner's own gcc gives a different hash, so build
+      # inside a digest-pinned Debian trixie image with exact package versions; the sha256 check in build.sh is
+      # unchanged and still fails the job on any mismatch. If Debian drops these versions, apt fails loudly;
+      # a toolchain change then needs a reviewed re-pin of deploy/noamx/noamx.so.sha256 (also compiled into
+      # sidecar-risk via NOAMX_PIN_FILE) plus an update of the versions below.
+      - name: make noamx (pinned toolchain container; builds + sha256-checks the shim used by edge t2_amx tests)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w \
+            debian:trixie@sha256:2dc419c6d7fe3dad0a2f9fd469c34cc90b0f9ba642d8fde837fe3d7d34a0e7f1 \
+            sh -euc 'apt-get update && apt-get install -y --no-install-recommends make gcc-14=14.2.0-19 cpp-14=14.2.0-19 binutils=2.44-3 libc6-dev && CC=gcc-14 make noamx && chown "$(stat -c %u:%g /w)" deploy/noamx/noamx.so'
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
